@@ -2,10 +2,11 @@ import { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { useAppStore } from '../../store';
 import { Building2, Mail, Lock, User, Phone, Shield, ArrowRight, ShieldCheck } from 'lucide-react';
+import { apiBootstrap, apiSignup, clearToken, setToken } from '../../utils/api';
 
 export default function SignupPage() {
   const navigate = useNavigate();
-  const { login, addSubAccount, setCurrentSubAccount } = useAppStore();
+  const { login, addSubAccount, setCurrentSubAccount, hydrateBackend, setBackendMode } = useAppStore();
   
   const [fullName, setFullName] = useState('');
   const [businessName, setBusinessName] = useState('');
@@ -26,8 +27,31 @@ export default function SignupPage() {
     setIsLoading(true);
     setError('');
 
-    // Simulate network delay
-    await new Promise((resolve) => setTimeout(resolve, 1200));
+    // ── 1) Real Cloudflare/D1 signup first (provisions tenant + pipeline) ──
+    const backendRes = await apiSignup({ fullName, businessName, email, phone, password });
+    if (backendRes.ok && backendRes.data?.token) {
+      setToken(backendRes.data.token);
+      const boot = await apiBootstrap();
+      if (boot.ok && boot.data) {
+        setBackendMode(true);
+        hydrateBackend(boot.data);
+        navigate('/dashboard');
+        return;
+      }
+      setError('Account created, but data sync failed. Please sign in.');
+      return;
+    }
+    if (backendRes.status && backendRes.status >= 400 && backendRes.status < 500) {
+      setError(backendRes.error === 'An account with this email already exists. Try signing in instead.'
+        ? 'An account with this email already exists. Try signing in instead.'
+        : (backendRes.error || 'Registration failed. Please try again.'));
+      return;
+    }
+
+    // ── 2) Backend not configured / unreachable → Demo Mode ──
+    clearToken();
+    setBackendMode(false);
+    await new Promise((resolve) => setTimeout(resolve, 800));
 
     try {
       const user = {

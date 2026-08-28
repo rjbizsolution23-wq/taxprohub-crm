@@ -86,21 +86,57 @@ Boot up the fast Vite dev server locally to test visual modifications:
 ```bash
 npm run dev
 ```
+To test the **real edge backend** (auth + D1 + integrations) locally:
+```bash
+npm run cf:dev    # builds + wrangler pages dev --local
+```
 
 ### 3. Compile Secure Single-File Production Bundle
 Build the optimized, minimized, and single-file inlined HTML production file:
 ```bash
 npx vite build
 ```
-*Your compiled artifact is saved as `dist/index.html` (size ~`1,800 kB`), completely bundling all JS, CSS, and icons, with active browser security shields pre-injected.*
+*Your compiled artifact is saved as `dist/index.html`, completely bundling all JS, CSS, and icons, with active browser security shields pre-injected.*
 
-### 4. Deploy to Cloudflare Pages CDN
-Upload your build directory directly to Cloudflare Pages:
+### 4. Connect the real backend (Cloudflare D1 + KV) — one time
 ```bash
-npx wrangler pages deploy dist --project-name tax-pro-hub-university --branch main
+export CLOUDFLARE_API_TOKEN=your-token   # Pages + D1 + KV edit scopes
+export CLOUDFLARE_ACCOUNT_ID=your-account-id
+npm run cf:setup    # creates D1 database + KV + Pages project, applies migrations
 ```
 
+### 5. Deploy to Cloudflare Pages CDN
+```bash
+npm run deploy    # vite build + wrangler pages deploy dist
+```
+*Full runbook: [`docs/DEPLOYMENT_RUNBOOK.md`](./docs/DEPLOYMENT_RUNBOOK.md).*
+
+> **Two modes.** With the D1 binding live, the app runs in **Backend Mode**:
+> real signup/login (PBKDF2-hashed passwords, 30-day sessions), tenant-scoped
+> CRUD persisted in D1, and every store action mirrored to the edge
+> automatically. Without it, the app stays in **Demo Mode** (localStorage
+> seed data) so it is always usable and demoable.
+
 ---
+
+## 🔌 BACKEND API v2 — What's live at the edge
+
+Every route below runs in `functions/api/[[route]].ts` (Cloudflare Pages
+Functions) against **D1** with per-tenant isolation:
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/auth/signup` · `login` · `logout` · `change-password` · `GET /api/auth/me` | Real auth (PBKDF2-SHA256, 30-day sessions, 409/401 semantics) |
+| `GET /api/v1/bootstrap` | Full tenant snapshot in one call (12 collections) |
+| `GET/POST /api/v1/:entity` · `GET/PUT/DELETE /api/v1/:entity/:id` | CRUD for contacts, deals, appointments, campaigns, workflows, funnels, websites, forms, blog-posts, preparers, payouts, pipelines |
+| `POST /api/sms/send` · `/api/email/send` | Twilio SMS · Resend/MailChannels email |
+| `POST /api/stripe/checkout` · `/connect` · `/webhook` | Stripe payments + HMAC-verified webhooks |
+| `POST /api/video/session` · `/api/llm/chat` | Cloudflare Calls · OpenAI-compatible proxy |
+| `POST /api/payouts/accrue` · `/api/keys` | D1 payout ledger · hashed API keys |
+| `GET /api/health` | Live integration status board |
+
+Full audit & architecture: [`ANALYSIS.md`](./ANALYSIS.md) ·
+Deployment: [`docs/DEPLOYMENT_RUNBOOK.md`](./docs/DEPLOYMENT_RUNBOOK.md)
 
 ## 🛡️ INTELLECTUAL PROPERTY & COMPLIANCE SIGNATURES
 * **Product Name**: RJ Business Solutions Tax Pro Hub University

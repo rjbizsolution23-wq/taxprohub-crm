@@ -7,7 +7,11 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "deploy": "vite build && npx wrangler pages deploy dist"
+    "typecheck": "tsc --noEmit",
+    "cf:setup": "node scripts/setup-cf.mjs",
+    "cf:dev": "npm run build && npx wrangler pages dev dist --local",
+    "db:migrate": "npx wrangler d1 execute taxprohub-crm --remote --file migrations/0001_init.sql",
+    "deploy": "npm run build && npx wrangler pages deploy dist --project-name tax-pro-hub-university"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

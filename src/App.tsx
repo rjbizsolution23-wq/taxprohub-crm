@@ -1,6 +1,7 @@
 import { HashRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { useAppStore } from './store';
 import { useEffect } from 'react';
+import { BackendBridge } from './utils/backendBridge';
 
 // Layout Components
 import AppShell from './components/layout/AppShell';
@@ -86,6 +87,8 @@ function App() {
 
   return (
     <HashRouter>
+      {/* Connects the app to the Cloudflare D1 backend (falls back to demo mode) */}
+      <BackendBridge />
       <Routes>
         {/* Public Marketing & Guest Routes */}
         <Route path="/" element={isAuthenticated ? <Navigate to="/dashboard" /> : <LandingPage />} />

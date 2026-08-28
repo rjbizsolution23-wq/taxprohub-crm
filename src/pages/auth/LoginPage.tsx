@@ -3,10 +3,11 @@ import { useNavigate, Link } from 'react-router-dom';
 import { useAppStore } from '../../store';
 import { Building2, Mail, Lock, Eye, EyeOff, ShieldCheck, Globe, Link2, Key, Terminal, RefreshCw, X } from 'lucide-react';
 import type { User } from '../../types';
+import { apiBootstrap, apiLogin, clearToken, setToken } from '../../utils/api';
 
 export default function LoginPage() {
   const navigate = useNavigate();
-  const { login, subAccounts, addSubAccount, setCurrentSubAccount } = useAppStore();
+  const { login, subAccounts, addSubAccount, setCurrentSubAccount, hydrateBackend, setBackendMode } = useAppStore();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -26,8 +27,29 @@ export default function LoginPage() {
     setIsLoading(true);
     setError('');
 
-    // Simulate API call
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    // ── 1) Real Cloudflare/D1 backend first ──
+    const backendRes = await apiLogin(email, password);
+    if (backendRes.ok && backendRes.data?.token) {
+      setToken(backendRes.data.token);
+      const boot = await apiBootstrap();
+      if (boot.ok && boot.data) {
+        setBackendMode(true);
+        hydrateBackend(boot.data);
+        navigate('/dashboard');
+        setIsLoading(false);
+        return;
+      }
+      setError('Backend session created but data sync failed. Using demo mode.');
+    } else if (backendRes.status === 401 || (backendRes.status >= 400 && backendRes.status < 500)) {
+      setError(backendRes.error === 'unauthenticated' ? 'Invalid email or password.' : (backendRes.error || 'Sign-in failed.'));
+      setIsLoading(false);
+      return;
+    }
+
+    // ── 2) Backend not configured / unreachable → Demo Mode (browser storage) ──
+    clearToken();
+    setBackendMode(false);
+    await new Promise((resolve) => setTimeout(resolve, 600));
 
     if (email && password) {
       // Create demo user
@@ -433,6 +455,8 @@ export default function LoginPage() {
                     addSubAccount(demoAccount);
                     setCurrentSubAccount(demoAccount);
                   }
+                  clearToken();
+                  setBackendMode(false);
                   login(user);
                   setSelectedChannel(null);
                   navigate('/dashboard');
@@ -504,6 +528,8 @@ export default function LoginPage() {
                     setCurrentSubAccount(demoAccount);
                   }
 
+                  clearToken();
+                  setBackendMode(false);
                   login(user);
                   setIsHandshaking(false);
                   setSelectedChannel(null);

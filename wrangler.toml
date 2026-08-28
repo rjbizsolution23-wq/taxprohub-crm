@@ -1,12 +1,13 @@
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 # CLOUDFLARE PAGES — RJ Business Solutions TAX PRO HUB UNIVERSITY
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 # Deploy:
-#   npm run build
-#   npx wrangler pages deploy dist --project-name tax-pro-hub-university
+#   npm run cf:setup   (one-time: creates D1 + KV, applies migrations,
+#                       fills the ids below)
+#   npm run deploy
 #
 # The functions/ directory ships automatically with Pages —
-# every /api/* route runs as a Cloudflare Worker at the edge.
+# every /api/* route runs as a Cloudflare Worker at the edge with D1.
 #
 # Secrets (set once per environment):
 #   npx wrangler pages secret put TWILIO_ACCOUNT_SID
@@ -20,15 +21,21 @@
 #   npx wrangler pages secret put OPENAI_BASE_URL
 #   npx wrangler pages secret put RESEND_API_KEY         # optional; MailChannels fallback is free
 #   npx wrangler pages secret put MAIL_FROM
-#
-# Durable ledger (payouts, referrals, stripe events):
-#   npx wrangler kv namespace create LEDGER
-#   → paste the returned id below and uncomment the binding.
+#   npx wrangler pages secret put SESSION_SECRET         # optional pepper for password hashes
 
 name = "tax-pro-hub-university"
 compatibility_date = "2026-08-01"
 pages_build_output_dir = "dist"
 
+# ── Durable ledger + session cache (KV) ──────────────────────────────
+# Replace id with: npx wrangler kv namespace create LEDGER
 [[kv_namespaces]]
 binding = "LEDGER"
 id = "efc2da2c19934e68a956a84bfe76f7a2"
+
+# ── Primary database (D1) — created by `npm run cf:setup` ────────────
+# Replace database_id with: npx wrangler d1 create taxprohub-crm
+[[d1_databases]]
+binding = "DB"
+database_name = "taxprohub-crm"
+database_id = "00000000-0000-0000-0000-000000000000"

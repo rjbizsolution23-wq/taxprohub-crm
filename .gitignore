@@ -148,3 +148,7 @@ tax-pro-src.zip
 # macOS FUSE filesystem artifacts (nested)
 **/.fuse_hidden*
 .fuse_hidden*
+.dev.vars
+
+# Stale source backup artifact
+ziY78y7V

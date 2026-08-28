@@ -57,26 +57,11 @@ info "Building production bundle..."
 npm run build
 ok "Build complete → dist/"
 
-# ── Create/verify CF Pages project ───────────────────────────────────
-info "Creating Pages project (safe to re-run if exists)..."
-CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" wrangler pages project create "$PROJECT" \
-  --production-branch main 2>/dev/null || warn "Project may already exist — continuing"
-
-# ── Create KV namespace LEDGER ────────────────────────────────────────
-info "Creating KV namespace LEDGER..."
-KV_OUTPUT=$(CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" wrangler kv namespace create LEDGER 2>&1)
-echo "$KV_OUTPUT"
-KV_ID=$(echo "$KV_OUTPUT" | grep -oE '"id": "[a-f0-9]+"' | head -1 | grep -oE '[a-f0-9]{32}' | head -1)
-if [[ -n "$KV_ID" ]]; then
-  ok "KV namespace LEDGER created: $KV_ID"
-  # Update wrangler.toml with the real KV ID
-  sed -i.bak "s/# \[\[kv_namespaces\]\]/[[kv_namespaces]]/" wrangler.toml
-  sed -i.bak "s/# binding = \"LEDGER\"/binding = \"LEDGER\"/" wrangler.toml
-  sed -i.bak "s/# id = \"YOUR_KV_NAMESPACE_ID\"/id = \"$KV_ID\"/" wrangler.toml
-  ok "wrangler.toml updated with KV binding"
-else
-  warn "Could not parse KV ID — check output above and add to wrangler.toml manually"
-fi
+# ── Create D1 + KV + Pages project, apply migrations ─────────────────
+# Idempotent; creates only what is missing and fills wrangler.toml ids.
+info "Provisioning D1 database, KV namespace & Pages project..."
+CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" CLOUDFLARE_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID:-$CF_ACCOUNT}" \
+  npm run cf:setup || warn "Provisioning failed — check your token scopes (Pages + D1 + KV edits)"
 
 # ── Deploy to Cloudflare Pages ────────────────────────────────────────
 info "Deploying to Cloudflare Pages..."
@@ -109,6 +94,9 @@ set_secret "STRIPE_WEBHOOK_SECRET"  ""   # Add after creating webhook in Stripe 
 set_secret "OPENAI_API_KEY"         "${CF_API_TOKEN}"
 set_secret "OPENAI_BASE_URL"        "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/ai/v1"
 set_secret "OPENAI_MODEL"           "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+
+# Auth pepper — set ONCE and keep stable (changing it invalidates passwords)
+set_secret "SESSION_SECRET"         "${SESSION_SECRET}"
 
 # Email
 set_secret "RESEND_API_KEY"         "${RESEND_API_KEY}"

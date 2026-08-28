@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { User, SubAccount, Contact, Pipeline, Deal, Appointment, Campaign, Workflow, Funnel, Website, Form, BlogPost, SocialAccount, Notification, BrandColors, DashboardWidget, Preparer, Payout } from '../types';
 import { sendCapiEvent } from '../utils/meta';
+import { clearToken, diffFingerprints, enqueueSync, fingerprintState, type BootstrapPayload, type Fingerprint } from '../utils/api';
 
 interface AppState {
   // Authentication
@@ -31,6 +32,9 @@ interface AppState {
   brandColors: BrandColors;
   sidebarOpen: boolean;
   activeModule: string;
+
+  // Backend connectivity — true when the Cloudflare D1 API is reachable
+  backendMode: boolean;
 
   // Preparers & Payouts (Active/Filtered)
   preparers: Preparer[];
@@ -132,6 +136,10 @@ interface AppState {
   setActiveModule: (module: string) => void;
   updateBrandColors: (colors: BrandColors) => void;
   updateDashboardWidgets: (widgets: DashboardWidget[]) => void;
+
+  // Backend bridge
+  setBackendMode: (mode: boolean) => void;
+  hydrateBackend: (data: BootstrapPayload) => void;
 }
 
 const defaultBrandColors: BrandColors = {
@@ -616,6 +624,23 @@ const getFilteredTenantData = (subAccount: SubAccount | null, state: any) => {
   };
 };
 
+/* ═══════════ BACKEND BRIDGE HELPERS (D1 → Zustand) ═══════════ */
+
+const toDate = (v: unknown): Date => {
+  if (v instanceof Date) return v;
+  if (!v) return new Date();
+  const d = new Date(String(v));
+  return Number.isNaN(d.getTime()) ? new Date() : d;
+};
+
+/** Coerce server payloads (ISO strings, camelCase) into store-shaped items. */
+const hydrateItem = <T extends Record<string, any>>(item: T, tenantId: string): T => ({
+  ...item,
+  subAccountId: item.subAccountId || tenantId,
+  createdAt: toDate(item.createdAt),
+  updatedAt: item.updatedAt !== undefined ? toDate(item.updatedAt) : item.updatedAt,
+});
+
 export const useAppStore = create<AppState>()(
   persist(
     (set, get) => ({
@@ -623,6 +648,7 @@ export const useAppStore = create<AppState>()(
       currentUser: null,
       currentSubAccount: null,
       isAuthenticated: false,
+      backendMode: false,
       subAccounts: seedSubAccounts,
 
       // Filtered data properties initialized with empty lists (or master values before selection)
@@ -1053,7 +1079,71 @@ export const useAppStore = create<AppState>()(
 
       // Authentication Actions
       login: (user) => set({ currentUser: user, isAuthenticated: true }),
-      logout: () => set({ currentUser: null, currentSubAccount: null, isAuthenticated: false }),
+      logout: () => {
+        clearToken();
+        set({ currentUser: null, currentSubAccount: null, isAuthenticated: false, backendMode: false });
+      },
+
+      // Backend bridge — flips into Cloudflare-backed mode and replaces the
+      // localStorage snapshot with the tenant's D1 data.
+      setBackendMode: (mode) => set({ backendMode: mode }),
+      hydrateBackend: (data) => set(() => {
+        const t = (data.tenant || {}) as any;
+        const tenant: SubAccount = {
+          id: t.id,
+          name: t.name || t.businessName || 'Tax Pro Hub Practice',
+          businessName: t.businessName || t.name || '',
+          businessAddress: t.businessAddress || '',
+          email: t.email || '',
+          phone: t.phone || '',
+          logo: t.logo,
+          colors: t.colors || defaultBrandColors,
+          domain: t.domain,
+          status: (t.status || 'active') as SubAccount['status'],
+          createdAt: toDate(t.createdAt),
+          updatedAt: toDate(t.updatedAt),
+        };
+        const u = (data.user || {}) as any;
+        const user: User = {
+          id: u.id,
+          email: u.email || '',
+          name: u.name || '',
+          role: (u.role || 'admin') as User['role'],
+          subAccountId: tenant.id,
+          createdAt: toDate(u.createdAt),
+        };
+        const tid = tenant.id;
+        return {
+          backendMode: true,
+          currentUser: user,
+          currentSubAccount: tenant,
+          isAuthenticated: true,
+          subAccounts: [tenant],
+          pipelines: (data.pipelines || []).map((p: any) => hydrateItem(p, tid)),
+          allContacts: (data.contacts || []).map((c: any) => hydrateItem(c, tid)),
+          allDeals: (data.deals || []).map((d: any) => hydrateItem(d, tid)),
+          allAppointments: (data.appointments || []).map((a: any) => hydrateItem(a, tid)),
+          allCampaigns: (data.campaigns || []).map((c: any) => hydrateItem(c, tid)),
+          allWorkflows: (data.workflows || []).map((w: any) => hydrateItem(w, tid)),
+          allFunnels: (data.funnels || []).map((f: any) => hydrateItem(f, tid)),
+          allWebsites: (data.websites || []).map((w: any) => hydrateItem(w, tid)),
+          allForms: (data.forms || []).map((f: any) => hydrateItem(f, tid)),
+          allBlogPosts: (data.blogPosts || []).map((b: any) => hydrateItem(b, tid)),
+          allPreparers: (data.preparers || []).map((p: any) => hydrateItem(p, tid)),
+          allPayouts: (data.payouts || []).map((p: any) => hydrateItem(p, tid)),
+          contacts: (data.contacts || []).map((c: any) => hydrateItem(c, tid)),
+          deals: (data.deals || []).map((d: any) => hydrateItem(d, tid)),
+          appointments: (data.appointments || []).map((a: any) => hydrateItem(a, tid)),
+          campaigns: (data.campaigns || []).map((c: any) => hydrateItem(c, tid)),
+          workflows: (data.workflows || []).map((w: any) => hydrateItem(w, tid)),
+          funnels: (data.funnels || []).map((f: any) => hydrateItem(f, tid)),
+          websites: (data.websites || []).map((w: any) => hydrateItem(w, tid)),
+          forms: (data.forms || []).map((f: any) => hydrateItem(f, tid)),
+          blogPosts: (data.blogPosts || []).map((b: any) => hydrateItem(b, tid)),
+          preparers: (data.preparers || []).map((p: any) => hydrateItem(p, tid)),
+          payouts: (data.payouts || []).map((p: any) => hydrateItem(p, tid)),
+        };
+      }),
       
       // Dynamic Sub-Account switcher with instant, leak-proof multi-tenant routing filter
       setCurrentSubAccount: (account) => set((state) => {
@@ -1463,3 +1553,27 @@ export const useAppStore = create<AppState>()(
     }
   )
 );
+
+/* ═══════════════════════════════════════════════════════════════════
+ * BACKEND MIRROR — optimistic replication of every store mutation to D1.
+ * When backendMode is on, each state change is diffed against the last
+ * snapshot; creates/updates are pushed as upserts, removals as deletes.
+ * The first snapshot after entering backend mode is the baseline (no
+ * re-upload of existing data).
+ * ═══════════════════════════════════════════════════════════════════ */
+let backendBaseline: Fingerprint | null = null;
+
+useAppStore.subscribe((state, prev) => {
+  if (!state.backendMode) return;
+  // First transition or first observed state in backend mode → capture baseline.
+  if (!backendBaseline || !prev.backendMode) {
+    backendBaseline = fingerprintState(state as any);
+    return;
+  }
+  const ops = diffFingerprints(backendBaseline, state as any);
+  backendBaseline = fingerprintState(state as any);
+  for (const op of ops) enqueueSync(op);
+});
+
+/** Replaces the mirror baseline (used after a manual pull/sync). */
+export const resetBackendBaseline = () => { backendBaseline = null; };

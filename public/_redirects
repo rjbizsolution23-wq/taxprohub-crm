@@ -1,1 +1,2 @@
-/* /index.html 200
+# HashRouter app — Cloudflare Pages serves index.html at / automatically.
+# No SPA fallback rules needed; /api/* is handled by Pages Functions.
