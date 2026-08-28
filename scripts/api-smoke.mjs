@@ -100,7 +100,7 @@ section('Health & bindings');
   ok('D1 bound', data.integrations?.database_d1 === true);
   ok('KV bound', data.integrations?.kv_ledger === true);
   ok('R2 vault bound', data.integrations?.r2_document_vault === true);
-  ok('24 compliance agents registered', data.integrations?.compliance_agents === 24, String(data.integrations?.compliance_agents));
+  ok('26 compliance agents registered', data.integrations?.compliance_agents === 26, String(data.integrations?.compliance_agents));
 }
 
 section('Auth');
@@ -222,11 +222,11 @@ section('Invoicing');
 section('Compliance agents');
 {
   const sweep = await api('/api/compliance/run', { method: 'POST', token, body: {} });
-  ok('full sweep runs 24 agents', sweep.data.agentsRun === 24, String(sweep.data.agentsRun));
+  ok('full sweep runs 26 agents', sweep.data.agentsRun === 26, String(sweep.data.agentsRun));
   ok('findings are produced from real data', sweep.data.opened > 0);
 
   const overview = await api('/api/compliance/overview', { token });
-  ok('overview returns the roster', (overview.data.agents || []).length === 24);
+  ok('overview returns the roster', (overview.data.agents || []).length === 26);
   ok('score is bounded 0..100', overview.data.chief?.score >= 0 && overview.data.chief?.score <= 100);
 
   const single = await api('/api/compliance/run', { method: 'POST', token, body: { agentKey: 'can_spam' } });
@@ -319,11 +319,97 @@ section('MFA (TOTP)');
   ok('recovery code cannot be reused', reuse.data.error === 'invalid_mfa_code');
 }
 
+section('IRS e-file pipeline');
+{
+  const sub = await api('/api/efile/submissions', { method: 'POST', token, body: { returnType: '1040', taxYear: '2025', contactId: 'eng1', dealId: 'dl1', refundCents: 421000 } });
+  ok('submission created in draft', sub.status === 201 && sub.data.status === 'draft');
+  const efileId = sub.data.id;
+
+  // Grace already signed a Form 8879 earlier in this suite, but the firm has no EFIN yet.
+  const noEfin = await api(`/api/efile/submissions/${efileId}/transmit`, { method: 'POST', token });
+  ok('transmit blocked without an EFIN', noEfin.status === 428 && noEfin.data.error === 'efin_missing', JSON.stringify(noEfin.data).slice(0, 80));
+
+  await api('/api/v1/preparers/pr1', { method: 'PUT', token, body: { id: 'pr1', firstName: 'Ann', lastName: 'Prep', email: 'ann@example.com', status: 'active', ptin: 'P11112222', efin: '123456' } });
+  const sub2 = await api('/api/efile/submissions', { method: 'POST', token, body: { returnType: '1040', taxYear: '2025', contactId: 'eng1' } });
+  const ready = await api(`/api/efile/submissions/${sub2.data.id}/transmit`, { method: 'POST', token });
+  ok('manual mode arms tracking without faking acceptance', ready.data.status === 'ready' && ready.data.configured === false);
+
+  const unsigned = await api('/api/v1/contacts', { method: 'POST', token, body: { id: 'nosig', firstName: 'Unsigned', lastName: 'Client', email: 'nosig@example.com' } });
+  const sub3 = await api('/api/efile/submissions', { method: 'POST', token, body: { returnType: '1040', taxYear: '2025', contactId: 'nosig' } });
+  const gated = await api(`/api/efile/submissions/${sub3.data.id}/transmit`, { method: 'POST', token });
+  ok('Pub 1345 gate: no transmit before Form 8879 is signed', gated.status === 428 && gated.data.error === 'form_8879_not_signed');
+
+  const rej = await api(`/api/efile/submissions/${efileId}/ack`, { method: 'POST', token, body: { status: 'rejected', rejectCodes: ['IND-031-04'], submissionId: '123456202500112345' } });
+  ok('rejection explains the IRS code', /prior-year agi/i.test(rej.data.rejectCodes?.[0]?.meaning || ''));
+  ok('perfection deadline set (Pub 1345)', !!rej.data.perfectionDeadline);
+
+  const tasks = await api('/api/v1/tasks', { token });
+  ok('rejection opens an urgent perfection task', (tasks.data.items || []).some((t) => /Perfect rejected 1040/.test(t.title)));
+
+  const acc = await api(`/api/efile/submissions/${efileId}/ack`, { method: 'POST', token, body: { status: 'accepted', ackCode: 'ACK' } });
+  ok('acceptance recorded', acc.data.status === 'accepted');
+
+  const list = await api('/api/efile/submissions', { token });
+  ok('reject code book is published', list.data.rejectCodeBook >= 9);
+  ok('status counts returned', typeof list.data.counts === 'object');
+}
+
+section('Bank products');
+{
+  const bp = await api('/api/bank/products', { method: 'POST', token, body: { productType: 'refund_advance', contactId: 'nosig', bank: 'Republic', requestedCents: 150000, prepFeeCents: 39900, bankFeeCents: 5900 } });
+  ok('application created', bp.status === 201);
+  ok('missing disclosure is flagged, not hidden', bp.data.disclosureOnFile === false && !!bp.data.warning);
+
+  const funded = await api(`/api/bank/products/${bp.data.id}`, { method: 'PUT', token, body: { status: 'funded', approvedCents: 100000 } });
+  ok('funding blocked without a signed disclosure (428)', funded.status === 428, String(funded.status));
+
+  // Deliver + sign the dedicated bank product disclosure first.
+  const disc = await api('/api/esign/requests', { method: 'POST', token, body: { contactId: 'eng1', docType: 'bank_disclosure' } });
+  const discToken = String(disc.data.link || '').split('token=')[1];
+  const discSigned = await api('/api/esign/sign', { method: 'POST', body: { token: discToken, signatureName: 'Grace Hopper', consent: true } });
+  ok('bank product disclosure signed', discSigned.data.status === 'signed');
+
+  const withSig = await api('/api/bank/products', { method: 'POST', token, body: { productType: 'refund_transfer', contactId: 'eng1', bank: 'TPG', requestedCents: 421000, prepFeeCents: 45000, bankFeeCents: 3900 } });
+  ok('client with a signed agreement passes the disclosure check', withSig.data.disclosureOnFile === true);
+
+  const ok2 = await api(`/api/bank/products/${withSig.data.id}`, { method: 'PUT', token, body: { status: 'funded', approvedCents: 421000 } });
+  ok('net to client nets out both fees', ok2.data.netToClientCents === 421000 - 45000 - 3900, String(ok2.data.netToClientCents));
+
+  const list = await api('/api/bank/products', { token });
+  ok('totals include missing-disclosure count', list.data.totals.missingDisclosures >= 1);
+
+  const sweep = await api('/api/compliance/run', { method: 'POST', token, body: { agentKey: 'bank_product_disclosures' } });
+  ok('compliance agent catches undisclosed funded products', typeof sweep.data.perAgent.bank_product_disclosures === 'number');
+}
+
+section('Privacy (DSAR)');
+{
+  const exp = await api('/api/privacy/requests', { method: 'POST', token, body: { contactId: 'eng1', kind: 'export' } });
+  ok('export bundle built + hashed', /^[0-9a-f]{64}$/.test(exp.data.sha256 || ''));
+  ok('export counts the records included', exp.data.recordCount > 0);
+
+  const dl = await fetch(`${BASE}/api/privacy/requests/${exp.data.id}/download`, { headers: { Authorization: `Bearer ${token}` } });
+  const bundle = JSON.parse(await dl.text());
+  ok('bundle includes every linked collection', ['contact', 'deals', 'documents', 'signatures', 'invoices', 'efile', 'bankProducts'].every((k) => k in bundle));
+
+  const anon = await fetch(`${BASE}/api/privacy/requests/${exp.data.id}/download`);
+  ok('DSAR download requires auth', anon.status === 401);
+
+  const erase = await api('/api/privacy/requests', { method: 'POST', token, body: { contactId: 'eng1', kind: 'erasure' } });
+  ok('erasure honours the statutory retention floor', erase.data.status === 'partial_legal_hold' && /IRC §6107/.test(erase.data.retainedNote || ''));
+
+  const after = await api('/api/v1/contacts/eng1', { token });
+  ok('identity pseudonymized', after.data.item?.firstName === 'Erased' && /redacted\.invalid$/.test(after.data.item?.email || ''));
+
+  const subs = await api('/api/submissions', { token });
+  ok('marketing submissions purged for that contact', !(subs.data.items || []).some((s) => s.contact_id === 'eng1'));
+}
+
 section('White-label sub-accounts & domains');
 {
   const sub = await api('/api/subaccounts', { method: 'POST', token, body: { name: 'Branch Practice', businessName: 'Branch Practice LLC', email: `branch${stamp}@example.com`, revenueSharePct: 15 } });
   ok('sub-account provisioned', sub.status === 201 && !!sub.data.tenantId);
-  ok('child gets its own 24-agent roster', sub.data.complianceAgents === 24);
+  ok('child gets its own full agent roster', sub.data.complianceAgents === 26);
 
   const list = await api('/api/subaccounts', { token });
   ok('sub-account appears with usage + findings', (list.data.items || []).some((i) => i.id === sub.data.tenantId));

@@ -60,6 +60,8 @@ interface Env {
   MAIL_FROM?: string;
   SESSION_SECRET?: string;
   CRON_SECRET?: string;
+  EFILE_PROVIDER_URL?: string;
+  EFILE_PROVIDER_KEY?: string;
   PORTAL_BASE_URL?: string;
 }
 
@@ -812,6 +814,7 @@ function health(env: Env) {
       cron_engine: !!env.CRON_SECRET,
       compliance_agents: COMPLIANCE_AGENTS.length,
       esign_engine: true,
+      efile_provider: !!env.EFILE_PROVIDER_URL,
       mfa_totp: true,
       plan_enforcement: true,
       invoicing: !!env.STRIPE_SECRET_KEY,
@@ -2118,6 +2121,44 @@ const COMPLIANCE_AGENTS: AgentDef[] = [
     },
   },
   {
+    key: 'efile_rejection_aging',
+    name: 'E-file Rejection Perfection Window',
+    domain: 'Filing lifecycle',
+    authority: 'IRS Pub 1345 (5-day perfection period for 1040 rejects)',
+    cadence: 'daily',
+    run: async (db, t) => {
+      const rows = await all(db, `SELECT id, return_type, tax_year, reject_codes, perfection_deadline FROM efile_submissions WHERE tenant_id = ? AND status = 'rejected'`, t);
+      return rows.filter((r) => r.perfection_deadline && String(r.perfection_deadline) < new Date(Date.now() + 2 * 86400000).toISOString()).map((r) => ({
+        fingerprint: `efile:perfection:${r.id}`,
+        severity: (String(r.perfection_deadline) < nowIso() ? 'critical' : 'high') as 'critical' | 'high',
+        title: `Rejected ${r.return_type} (TY${r.tax_year}) is at or past its perfection deadline`,
+        detail: `Reject codes ${safeJson<string[]>(r.reject_codes, []).join(', ') || 'unspecified'}. After the perfection window closes the return is no longer treated as timely filed when retransmitted.`,
+        entityType: 'efile_submission', entityId: String(r.id),
+        remediation: 'Correct the reject codes and retransmit, or paper-file with proof of timely e-file attempt.',
+        deepLink: '#/efile',
+      }));
+    },
+  },
+  {
+    key: 'bank_product_disclosures',
+    name: 'Bank Product Disclosure Control',
+    domain: 'Refund advance / RT',
+    authority: 'Truth in Lending (Reg Z); bank program agreements; Circular 230 §10.27',
+    cadence: 'daily',
+    run: async (db, t) => {
+      const rows = await all(db, `SELECT id, product_type, status, disclosure_signed_id FROM bank_products WHERE tenant_id = ?`, t);
+      return rows.filter((r) => !r.disclosure_signed_id && ['approved', 'funded', 'settled'].includes(String(r.status))).map((r) => ({
+        fingerprint: `bank:disclosure:${r.id}`,
+        severity: 'critical' as const,
+        title: `${String(r.product_type).replace(/_/g, ' ')} advanced without a signed disclosure on file`,
+        detail: 'Fee and APR disclosures must be delivered and acknowledged before a refund-advance or refund-transfer product is funded.',
+        entityType: 'bank_product', entityId: String(r.id),
+        remediation: 'Obtain the signed disclosure now and attach it to the client record; report the gap to the bank partner if funding already occurred.',
+        deepLink: '#/efile',
+      }));
+    },
+  },
+  {
     key: 'backup_continuity',
     name: 'Backup & Continuity',
     domain: 'Business continuity',
@@ -2495,6 +2536,31 @@ function renderStandardDocument(kind: string, ctx: { contact: any; tenant: any; 
         'services, and to disclose that information to affiliated service providers for those purposes.',
       ].join('\n');
 
+    case 'bank_disclosure':
+      return [
+        'Bank Product Disclosure and Consent',
+        '',
+        `Client: ${client}`,
+        `Provided by: ${firm}`,
+        '',
+        'A refund transfer or refund advance is an optional product. You are NOT required to purchase it',
+        'to have your return prepared or electronically filed. You may receive your refund directly from',
+        'the IRS at no cost, typically within 21 days of acceptance for direct deposit.',
+        '',
+        'FEES. Tax preparation fees, bank product fees and any transmitter or technology fees will be',
+        'deducted from your refund before the remaining balance is disbursed to you. The itemized fee',
+        'schedule accompanying this disclosure forms part of this agreement.',
+        '',
+        'ADVANCE PRODUCTS. A refund advance is a loan secured by your anticipated refund. Approval is',
+        'determined by the bank, not by this firm. If your refund is less than expected, you remain',
+        'responsible to the bank under its loan agreement.',
+        '',
+        'TIMING. Disbursement occurs only after the IRS funds the refund; neither this firm nor the bank',
+        'controls IRS processing times.',
+        '',
+        'I acknowledge that I received, read and understood this disclosure before applying.',
+      ].join('\n');
+
     case 'croa_disclosure':
       return [
         'Consumer Credit File Rights Under State and Federal Law',
@@ -2566,6 +2632,7 @@ async function createSignatureRequest(env: Env, request: Request, body: Record<s
     form_8879: 'IRS e-file Signature Authorization (Form 8879)',
     consent_7216: 'Consent to Use and Disclose Tax Return Information (§7216)',
     croa_disclosure: 'Consumer Credit File Rights Disclosure (CROA)',
+    bank_disclosure: 'Bank Product Disclosure and Consent',
   }[docType] || 'Engagement Letter');
 
   const token = randHex(32);
@@ -3757,6 +3824,423 @@ async function resolveBranding(env: Env, request: Request, url: URL) {
   });
 }
 
+
+/* ═══════════════ IRS E-FILE PIPELINE (MeF lifecycle) ═══════════════
+ * Tracks the real submission lifecycle: draft → ready → transmitted →
+ * accepted | rejected → perfected. Reject codes carry the published IRS
+ * meaning and the fix, and a rejected 1040 automatically opens a task with
+ * the Pub 1345 five-day perfection deadline.
+ *
+ * Transmission itself requires an authorized MeF provider (Drake, TaxSlayer,
+ * CCH, or direct A2A). Without EFILE_PROVIDER_URL/KEY the endpoints operate in
+ * "manual" mode: you record the submission id and acknowledgement yourself,
+ * and nothing is ever faked as accepted.
+ */
+
+const IRS_REJECT_CODES: Record<string, { meaning: string; fix: string }> = {
+  'IND-031-04': {
+    meaning: 'Prior-year AGI or Self-Select PIN does not match IRS records for the primary taxpayer.',
+    fix: 'Pull the prior-year AGI from the IRS transcript (not the client’s copy) and retransmit.',
+  },
+  'IND-032-04': {
+    meaning: 'Prior-year AGI or PIN mismatch for the spouse on a joint return.',
+    fix: 'Verify the spouse’s prior-year AGI separately — it differs when they filed separately last year.',
+  },
+  'IND-181-01': {
+    meaning: 'Identity Protection PIN missing when the IRS has one on file.',
+    fix: 'Obtain the client’s current-year IP PIN from their CP01A notice or IRS online account.',
+  },
+  'IND-996': {
+    meaning: 'Dependent’s Identity Protection PIN is missing or incorrect.',
+    fix: 'Collect the dependent’s IP PIN; it is issued annually and changes each January.',
+  },
+  'F1040-512': {
+    meaning: 'A dependent SSN on this return was already claimed on another accepted return.',
+    fix: 'Confirm the client’s right to claim; if valid, the return must be paper-filed with substantiation.',
+  },
+  'R0000-500-01': {
+    meaning: 'Primary taxpayer SSN and name control do not match IRS/SSA records.',
+    fix: 'Match the name exactly to the Social Security card; a recent name change may not be posted yet.',
+  },
+  'R0000-902-01': {
+    meaning: 'A return with this SSN has already been accepted for this tax year.',
+    fix: 'Likely identity theft or a duplicate filing — file Form 14039 and paper-file the return.',
+  },
+  'SEIC-F1040-501-02': {
+    meaning: 'Qualifying child SSN/name control mismatch on Schedule EIC.',
+    fix: 'Verify the child’s SSN card details; EIC due-diligence documentation must be retained.',
+  },
+  'F8962-070': {
+    meaning: 'Form 8962 is missing though a Form 1095-A was issued to the household.',
+    fix: 'Attach Form 8962 reconciling the premium tax credit and retransmit.',
+  },
+};
+
+const PERFECTION_DAYS: Record<string, number> = { '1040': 5, '1065': 10, '1120': 10, '1120S': 10, '941': 10 };
+
+async function createEfileSubmission(env: Env, request: Request, body: Record<string, any>) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+
+  const taxYear = String(body.taxYear || new Date().getFullYear() - 1);
+  const returnType = String(body.returnType || '1040');
+  const id = uuid();
+  const now = nowIso();
+
+  // EFIN comes from the practice's preparer records — never invented.
+  const efinRow = await env.DB.prepare(`SELECT efin FROM preparers WHERE tenant_id = ? AND efin IS NOT NULL AND efin != '' LIMIT 1`)
+    .bind(a.tenant.id).first<Record<string, unknown>>();
+
+  await env.DB.prepare(
+    `INSERT INTO efile_submissions (id, tenant_id, deal_id, contact_id, return_type, tax_year, jurisdiction, efin,
+       provider, status, refund_cents, balance_due_cents, notes, created_by, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?)`,
+  ).bind(id, a.tenant.id, body.dealId || null, body.contactId || null, returnType, taxYear,
+    String(body.jurisdiction || 'federal'), String(efinRow?.efin || ''),
+    env.EFILE_PROVIDER_URL ? 'mef_provider' : 'manual',
+    Number(body.refundCents || 0), Number(body.balanceDueCents || 0), String(body.notes || ''),
+    a.user.id, now, now).run();
+
+  await env.DB.prepare(`INSERT INTO efile_events (id, tenant_id, submission_id, event, detail, created_at) VALUES (?, ?, ?, 'created', ?, ?)`)
+    .bind(uuid(), a.tenant.id, id, JSON.stringify({ returnType, taxYear }), now).run();
+
+  await audit(env, { tenantId: String(a.tenant.id), userId: String(a.user.id), action: 'efile.created', resource: 'efile_submissions', resourceId: id, request });
+  return json({ ok: true, id, status: 'draft', efin: efinRow?.efin || null, provider: env.EFILE_PROVIDER_URL ? 'mef_provider' : 'manual' }, 201);
+}
+
+/** Transmit through the configured MeF provider, or arm manual tracking. */
+async function transmitEfile(env: Env, request: Request, id: string) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+
+  const sub = await env.DB.prepare('SELECT * FROM efile_submissions WHERE id = ? AND tenant_id = ?')
+    .bind(id, a.tenant.id).first<Record<string, any>>();
+  if (!sub) return json({ ok: false, error: 'not_found' }, 404);
+  if (sub.status === 'accepted') return json({ ok: false, error: 'already_accepted' }, 409);
+
+  // Hard gate: Form 8879 must be signed before an ERO may transmit (Pub 1345).
+  if (sub.contact_id) {
+    const signed = await env.DB.prepare(
+      `SELECT id FROM signature_requests WHERE tenant_id = ? AND contact_id = ? AND doc_type = 'form_8879' AND status = 'signed'`,
+    ).bind(a.tenant.id, sub.contact_id).first();
+    if (!signed) {
+      return json({
+        ok: false, error: 'form_8879_not_signed',
+        hint: 'IRS Pub 1345 forbids transmitting before the taxpayer signs Form 8879. Send it for signature first.',
+      }, 428);
+    }
+  }
+  if (!sub.efin) {
+    return json({ ok: false, error: 'efin_missing', hint: 'Record the firm EFIN on a preparer profile before transmitting.' }, 428);
+  }
+
+  const now = nowIso();
+  if (!env.EFILE_PROVIDER_URL || !env.EFILE_PROVIDER_KEY) {
+    // Manual mode — arm tracking, never claim the IRS accepted anything.
+    await env.DB.prepare(`UPDATE efile_submissions SET status = 'ready', updated_at = ? WHERE id = ?`).bind(now, id).run();
+    await env.DB.prepare(`INSERT INTO efile_events (id, tenant_id, submission_id, event, detail, created_at) VALUES (?, ?, ?, 'ready_manual', '{}', ?)`)
+      .bind(uuid(), a.tenant.id, id, now).run();
+    return json({
+      ok: true, status: 'ready', mode: 'manual', configured: false,
+      hint: 'No MeF provider configured. Transmit in your provider software, then POST /api/efile/submissions/:id/ack with the submission id and acknowledgement.',
+      needs: ['EFILE_PROVIDER_URL', 'EFILE_PROVIDER_KEY'],
+    });
+  }
+
+  try {
+    const res = await fetch(`${env.EFILE_PROVIDER_URL.replace(/\/$/, '')}/submissions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.EFILE_PROVIDER_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ efin: sub.efin, returnType: sub.return_type, taxYear: sub.tax_year, reference: id }),
+    });
+    const data = await res.json().catch(() => ({})) as Record<string, any>;
+    if (!res.ok) {
+      await env.DB.prepare(`INSERT INTO efile_events (id, tenant_id, submission_id, event, detail, created_at) VALUES (?, ?, ?, 'transmit_failed', ?, ?)`)
+        .bind(uuid(), a.tenant.id, id, JSON.stringify(data).slice(0, 400), now).run();
+      return json({ ok: false, error: 'provider_error', detail: data }, 502);
+    }
+    await env.DB.prepare(`UPDATE efile_submissions SET status = 'transmitted', submission_id = ?, transmitted_at = ?, updated_at = ? WHERE id = ?`)
+      .bind(String(data.submissionId || ''), now, now, id).run();
+    await env.DB.prepare(`INSERT INTO efile_events (id, tenant_id, submission_id, event, detail, created_at) VALUES (?, ?, ?, 'transmitted', ?, ?)`)
+      .bind(uuid(), a.tenant.id, id, JSON.stringify({ submissionId: data.submissionId }), now).run();
+    return json({ ok: true, status: 'transmitted', submissionId: data.submissionId });
+  } catch (e) {
+    return json({ ok: false, error: 'provider_unreachable', detail: String(e).slice(0, 200) }, 502);
+  }
+}
+
+/** Record an acknowledgement — from the provider poll, a webhook, or manually. */
+async function ackEfile(env: Env, request: Request, id: string, body: Record<string, any>) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+
+  const sub = await env.DB.prepare('SELECT * FROM efile_submissions WHERE id = ? AND tenant_id = ?')
+    .bind(id, a.tenant.id).first<Record<string, any>>();
+  if (!sub) return json({ ok: false, error: 'not_found' }, 404);
+
+  const status = String(body.status || '').toLowerCase();
+  if (!['accepted', 'rejected'].includes(status)) return bad('status_must_be_accepted_or_rejected');
+  const codes: string[] = Array.isArray(body.rejectCodes) ? body.rejectCodes.map(String) : [];
+  const now = nowIso();
+  const days = PERFECTION_DAYS[String(sub.return_type)] || 10;
+  const deadline = status === 'rejected' ? new Date(Date.now() + days * 86400000).toISOString() : null;
+
+  await env.DB.prepare(
+    `UPDATE efile_submissions SET status = ?, ack_code = ?, reject_codes = ?, acked_at = ?, perfection_deadline = ?,
+       submission_id = COALESCE(NULLIF(?, ''), submission_id), updated_at = ? WHERE id = ?`,
+  ).bind(status, String(body.ackCode || ''), JSON.stringify(codes), now, deadline, String(body.submissionId || ''), now, id).run();
+
+  await env.DB.prepare(`INSERT INTO efile_events (id, tenant_id, submission_id, event, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
+    .bind(uuid(), a.tenant.id, id, status, JSON.stringify({ codes, ackCode: body.ackCode }), now).run();
+
+  const explained = codes.map((c) => ({ code: c, ...(IRS_REJECT_CODES[c] || { meaning: 'Code not in the local knowledge base — check the IRS Business Rules index.', fix: 'Review the provider acknowledgement detail.' }) }));
+
+  if (status === 'rejected') {
+    // Rejections become real work with the statutory perfection window attached.
+    await env.DB.prepare(
+      `INSERT INTO tasks (id, tenant_id, title, description, contact_id, deal_id, priority, status, due_at, tags, source, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'urgent', 'To-Do', ?, ?, 'efile', ?, ?)`,
+    ).bind(uuid(), a.tenant.id,
+      `Perfect rejected ${sub.return_type} (${codes.join(', ') || 'no code'})`,
+      explained.map((e) => `${e.code}: ${e.meaning}\nFix: ${e.fix}`).join('\n\n'),
+      sub.contact_id, sub.deal_id, deadline, JSON.stringify(['E-file', 'Rejection']), now, now).run();
+  } else if (sub.deal_id) {
+    await env.DB.prepare(`UPDATE deals SET probability = 100, updated_at = ? WHERE id = ? AND tenant_id = ?`)
+      .bind(now, sub.deal_id, a.tenant.id).run();
+  }
+
+  await audit(env, { tenantId: String(a.tenant.id), userId: String(a.user.id), action: `efile.${status}`, resource: 'efile_submissions', resourceId: id, details: { codes }, request });
+  return json({ ok: true, status, rejectCodes: explained, perfectionDeadline: deadline });
+}
+
+async function listEfile(env: Env, request: Request) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const rows = await env.DB.prepare('SELECT * FROM efile_submissions WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 200')
+    .bind(a.tenant.id).all<Record<string, any>>();
+  const items = (rows.results || []).map((r) => ({
+    ...r,
+    reject_codes: safeJson<string[]>(r.reject_codes, []),
+    rejectDetail: safeJson<string[]>(r.reject_codes, []).map((c) => ({ code: c, ...(IRS_REJECT_CODES[c] || {}) })),
+  }));
+  const counts: Record<string, number> = {};
+  items.forEach((i) => { counts[String(i.status)] = (counts[String(i.status)] || 0) + 1; });
+  return json({ ok: true, items, counts, providerConfigured: !!env.EFILE_PROVIDER_URL, rejectCodeBook: Object.keys(IRS_REJECT_CODES).length });
+}
+
+/* ═══════════════ BANK PRODUCTS (refund advance / RT) ═══════════════ */
+
+async function createBankProduct(env: Env, request: Request, body: Record<string, any>) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+
+  const type = String(body.productType || 'refund_transfer');
+  if (!['refund_advance', 'refund_transfer', 'rac'].includes(type)) return bad('unknown_product_type');
+  const requested = Number(body.requestedCents || 0);
+  const prepFee = Number(body.prepFeeCents || 0);
+  const bankFee = Number(body.bankFeeCents || 0);
+
+  // Truth-in-lending style guard: the client must have signed a disclosure.
+  const disclosure = body.contactId
+    ? await env.DB.prepare(
+        `SELECT id FROM signature_requests WHERE tenant_id = ? AND contact_id = ? AND status = 'signed'
+         AND doc_type IN ('bank_disclosure', 'engagement_letter') ORDER BY signed_at DESC LIMIT 1`,
+      ).bind(a.tenant.id, body.contactId).first<Record<string, unknown>>()
+    : null;
+
+  const id = uuid();
+  const now = nowIso();
+  await env.DB.prepare(
+    `INSERT INTO bank_products (id, tenant_id, contact_id, deal_id, efile_id, product_type, bank, requested_cents,
+       prep_fee_cents, bank_fee_cents, status, disbursement, disclosure_signed_id, applied_at, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'applied', ?, ?, ?, ?, ?)`,
+  ).bind(id, a.tenant.id, body.contactId || null, body.dealId || null, body.efileId || null, type,
+    String(body.bank || ''), requested, prepFee, bankFee, String(body.disbursement || 'direct_deposit'),
+    disclosure?.id || null, now, now, now).run();
+
+  await audit(env, { tenantId: String(a.tenant.id), userId: String(a.user.id), action: 'bank.applied', resource: 'bank_products', resourceId: id, details: { type, requested }, request });
+  return json({
+    ok: true, id, status: 'applied', productType: type,
+    disclosureOnFile: !!disclosure,
+    warning: disclosure ? undefined : 'No signed client agreement found — bank product disclosures must be delivered and signed before funding.',
+  }, 201);
+}
+
+async function decideBankProduct(env: Env, request: Request, id: string, body: Record<string, any>) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const row = await env.DB.prepare('SELECT * FROM bank_products WHERE id = ? AND tenant_id = ?')
+    .bind(id, a.tenant.id).first<Record<string, any>>();
+  if (!row) return json({ ok: false, error: 'not_found' }, 404);
+
+  const status = String(body.status || '');
+  if (!['approved', 'denied', 'funded', 'settled', 'cancelled'].includes(status)) return bad('invalid_status');
+
+  const approved = Number(body.approvedCents ?? row.approved_cents ?? 0);
+  const net = Math.max(0, approved - Number(row.prep_fee_cents || 0) - Number(row.bank_fee_cents || 0));
+  const now = nowIso();
+
+  if (status === 'funded' && !row.disclosure_signed_id) {
+    return json({
+      ok: false, error: 'disclosure_required',
+      hint: 'A signed client agreement/disclosure must exist before a bank product is funded.',
+    }, 428);
+  }
+
+  await env.DB.prepare(
+    `UPDATE bank_products SET status = ?, approved_cents = ?, net_to_client_cents = ?, denial_reason = ?,
+       decided_at = COALESCE(decided_at, ?), funded_at = ?, updated_at = ? WHERE id = ?`,
+  ).bind(status, approved, net, String(body.denialReason || ''), now,
+    status === 'funded' ? now : row.funded_at, now, id).run();
+
+  await audit(env, { tenantId: String(a.tenant.id), userId: String(a.user.id), action: `bank.${status}`, resource: 'bank_products', resourceId: id, details: { approved, net }, request });
+  return json({ ok: true, id, status, approvedCents: approved, netToClientCents: net });
+}
+
+async function listBankProducts(env: Env, request: Request) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const rows = await env.DB.prepare('SELECT * FROM bank_products WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 200')
+    .bind(a.tenant.id).all<Record<string, any>>();
+  const items = rows.results || [];
+  const totals = {
+    applied: items.length,
+    fundedCents: items.filter((i) => i.status === 'funded' || i.status === 'settled').reduce((s, i) => s + Number(i.approved_cents || 0), 0),
+    prepFeesCents: items.reduce((s, i) => s + Number(i.prep_fee_cents || 0), 0),
+    missingDisclosures: items.filter((i) => !i.disclosure_signed_id).length,
+  };
+  return json({ ok: true, items, totals });
+}
+
+/* ═══════════ PRIVACY — data export & right-to-erasure (DSAR) ═══════════ */
+
+async function privacyRequest(env: Env, request: Request, body: Record<string, any>) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+
+  const kind = String(body.kind || 'export');
+  if (!['export', 'erasure'].includes(kind)) return bad('kind_must_be_export_or_erasure');
+  const contactId = String(body.contactId || '');
+  if (!contactId) return bad('contactId_required');
+
+  const tenantId = String(a.tenant.id);
+  const contact = await env.DB.prepare('SELECT * FROM contacts WHERE id = ? AND tenant_id = ?')
+    .bind(contactId, tenantId).first<Record<string, any>>();
+  if (!contact) return json({ ok: false, error: 'contact_not_found' }, 404);
+
+  const q = async (sql: string, ...b: unknown[]) =>
+    ((await env.DB!.prepare(sql).bind(...b).all<Record<string, any>>()).results || []);
+
+  const bundle = {
+    generatedAt: nowIso(),
+    requestedBy: a.user.email,
+    tenantId,
+    contact,
+    deals: await q('SELECT * FROM deals WHERE tenant_id = ? AND contact_id = ?', tenantId, contactId),
+    appointments: await q('SELECT * FROM appointments WHERE tenant_id = ? AND contact_id = ?', tenantId, contactId),
+    documents: await q('SELECT id, name, folder, doc_type, size, sha256, created_at FROM files WHERE tenant_id = ? AND contact_id = ?', tenantId, contactId),
+    signatures: await q('SELECT id, title, doc_type, status, signed_at, signature_ip FROM signature_requests WHERE tenant_id = ? AND contact_id = ?', tenantId, contactId),
+    invoices: await q('SELECT id, number, amount_cents, status, paid_at FROM invoices WHERE tenant_id = ? AND contact_id = ?', tenantId, contactId),
+    submissions: await q('SELECT id, form_id, payload, source, created_at FROM form_submissions WHERE tenant_id = ? AND contact_id = ?', tenantId, contactId),
+    efile: await q('SELECT id, return_type, tax_year, status, acked_at FROM efile_submissions WHERE tenant_id = ? AND contact_id = ?', tenantId, contactId),
+    bankProducts: await q('SELECT id, product_type, status, approved_cents, funded_at FROM bank_products WHERE tenant_id = ? AND contact_id = ?', tenantId, contactId),
+    campaignHistory: await q('SELECT campaign_id, channel, status, sent_at FROM campaign_recipients WHERE tenant_id = ? AND contact_id = ?', tenantId, contactId),
+  };
+
+  const text = JSON.stringify(bundle, null, 2);
+  const bytes = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  const sha = Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  const id = uuid();
+  const title = `dsar-${kind}-${contactId.slice(0, 8)}-${nowIso().slice(0, 10)}.json`;
+  let key = '';
+  if (env.DOCS) {
+    key = `tenants/${tenantId}/dsar/${id}/${title}`;
+    await env.DOCS.put(key, bytes, { httpMetadata: { contentType: 'application/json' }, customMetadata: { kind: `dsar-${kind}`, sha256: sha } });
+  }
+
+  const recordCount = Object.values(bundle).reduce((n, v) => n + (Array.isArray(v) ? v.length : 0), 0);
+  let status = 'complete';
+  let retained = '';
+
+  if (kind === 'erasure') {
+    // Tax records carry a statutory retention floor — erase marketing data,
+    // pseudonymize the identity, and disclose exactly what must be retained.
+    const taxDocs = bundle.documents.length;
+    const returns = bundle.efile.length;
+    const now = nowIso();
+
+    await env.DB.prepare(
+      `UPDATE contacts SET first_name = 'Erased', last_name = 'Contact', email = ?, phone = '', company = '',
+         notes = '[]', activities = '[]', custom_fields = '{}', tags = ?, status = 'erased', updated_at = ?
+       WHERE id = ? AND tenant_id = ?`,
+    ).bind(`erased+${contactId.slice(0, 8)}@redacted.invalid`, JSON.stringify(['Erased']), now, contactId, tenantId).run();
+    await env.DB.prepare('DELETE FROM campaign_recipients WHERE tenant_id = ? AND contact_id = ?').bind(tenantId, contactId).run();
+    await env.DB.prepare('DELETE FROM form_submissions WHERE tenant_id = ? AND contact_id = ?').bind(tenantId, contactId).run();
+    await env.DB.prepare(`UPDATE workflow_runs SET status = 'cancelled', updated_at = ? WHERE tenant_id = ? AND contact_id = ?`)
+      .bind(now, tenantId, contactId).run();
+    await env.DB.prepare('DELETE FROM portal_sessions WHERE tenant_id = ? AND contact_id = ?').bind(tenantId, contactId).run();
+    await env.DB.prepare('DELETE FROM portal_tokens WHERE tenant_id = ? AND contact_id = ?').bind(tenantId, contactId).run();
+
+    if (taxDocs || returns) {
+      status = 'partial_legal_hold';
+      retained = `${taxDocs} tax document(s) and ${returns} filed return record(s) retained under IRC §6107(b) ` +
+        '(three-year preparer retention) and the practice records schedule. Marketing data, submissions, ' +
+        'portal sessions and identity fields were erased or pseudonymized.';
+    } else {
+      retained = 'No statutory records required retention; all identifying data erased or pseudonymized.';
+    }
+  }
+
+  await env.DB.prepare(
+    `INSERT INTO data_requests (id, tenant_id, contact_id, kind, status, requested_by, r2_key, size, sha256, records_count, retained_note, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(id, tenantId, contactId, kind, status, String(a.user.email), key, bytes.length, sha, recordCount, retained, nowIso()).run();
+
+  await audit(env, { tenantId, userId: String(a.user.id), action: `privacy.${kind}`, resource: 'data_requests', resourceId: id, details: { contactId, recordCount, status }, request });
+  return json({
+    ok: true, id, kind, status, recordCount, sizeBytes: bytes.length, sha256: sha,
+    retainedNote: retained || undefined, archived: !!key,
+    downloadUrl: `/api/privacy/requests/${id}/download`,
+  }, 201);
+}
+
+async function listPrivacyRequests(env: Env, request: Request) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const rows = await env.DB.prepare('SELECT * FROM data_requests WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 100')
+    .bind(a.tenant.id).all<Record<string, unknown>>();
+  return json({ ok: true, items: (rows.results || []).map((r) => ({ ...r, downloadUrl: `/api/privacy/requests/${r.id}/download` })) });
+}
+
+async function downloadPrivacyRequest(env: Env, request: Request, id: string) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const row = await env.DB.prepare('SELECT * FROM data_requests WHERE id = ? AND tenant_id = ?')
+    .bind(id, a.tenant.id).first<Record<string, any>>();
+  if (!row) return json({ ok: false, error: 'not_found' }, 404);
+  if (!env.DOCS || !row.r2_key) return json({ ok: false, error: 'no_object_store' }, 410);
+  const obj = await env.DOCS.get(String(row.r2_key));
+  if (!obj) return json({ ok: false, error: 'object_missing' }, 410);
+  return new Response(obj.body, {
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Disposition': `attachment; filename="dsar-${row.kind}-${id.slice(0, 8)}.json"`,
+      'Cache-Control': 'private, no-store',
+    },
+  });
+}
+
 /* ═══════════════════════════ ROUTER ═══════════════════════════ */
 export const onRequest = async (ctx: Ctx): Promise<Response> => {
   const { request, env, params } = ctx;
@@ -3785,6 +4269,41 @@ export const onRequest = async (ctx: Ctx): Promise<Response> => {
 
     /* ── Bootstrap ── */
     if (route === '/v1/bootstrap' && request.method === 'GET') return handleBootstrap(env, request);
+
+    /* ── IRS e-file pipeline ── */
+    if (route === '/efile/submissions' && request.method === 'GET') return listEfile(env, request);
+    if (route === '/efile/submissions' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return createEfileSubmission(env, request, body);
+    }
+    if (/^\/efile\/submissions\/[^/]+\/transmit$/.test(route) && request.method === 'POST') {
+      return transmitEfile(env, request, route.split('/')[3]);
+    }
+    if (/^\/efile\/submissions\/[^/]+\/ack$/.test(route) && request.method === 'POST') {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return ackEfile(env, request, route.split('/')[3], body);
+    }
+
+    /* ── Bank products ── */
+    if (route === '/bank/products' && request.method === 'GET') return listBankProducts(env, request);
+    if (route === '/bank/products' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return createBankProduct(env, request, body);
+    }
+    if (/^\/bank\/products\/[^/]+$/.test(route) && request.method === 'PUT') {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return decideBankProduct(env, request, route.split('/')[3], body);
+    }
+
+    /* ── Privacy (DSAR) ── */
+    if (route === '/privacy/requests' && request.method === 'GET') return listPrivacyRequests(env, request);
+    if (route === '/privacy/requests' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return privacyRequest(env, request, body);
+    }
+    if (/^\/privacy\/requests\/[^/]+\/download$/.test(route) && request.method === 'GET') {
+      return downloadPrivacyRequest(env, request, route.split('/')[3]);
+    }
 
     /* ── White-label sub-accounts & domains ── */
     if (route === '/subaccounts' && request.method === 'GET') return listSubAccounts(env, request);

@@ -19,6 +19,7 @@ import SecurityPage from './pages/SecurityPage';
 import PublicFormPage from './pages/PublicFormPage';
 import PayoutRunsPage from './pages/PayoutRunsPage';
 import WhiteLabelPage from './pages/WhiteLabelPage';
+import EfilePage from './pages/EfilePage';
 
 // Main Pages
 import DashboardPage from './pages/DashboardPage';
@@ -222,6 +223,7 @@ function App() {
           <Route path="/security" element={<SecurityPage />} />
           <Route path="/payout-runs" element={<PayoutRunsPage />} />
           <Route path="/white-label" element={<WhiteLabelPage />} />
+          <Route path="/efile" element={<EfilePage />} />
           <Route path="/ecosystem" element={<EcosystemPage />} />
           
           {/* Administration & Customizer Settings */}

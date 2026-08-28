@@ -9,9 +9,10 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   ShieldCheck, KeyRound, Smartphone, Copy, CheckCircle2, AlertTriangle,
-  Loader2, Gauge, Crown, Building2, RefreshCw,
+  Loader2, Gauge, Crown, Building2, RefreshCw, FileJson, Trash2, Download,
 } from 'lucide-react';
 import { apiFetch } from '../utils/api';
+import { useAppStore } from '../store';
 
 interface Plan {
   key: string; label: string; priceMonthly: number; seats: number; contacts: number;
@@ -36,6 +37,10 @@ const METRICS: { key: string; label: string }[] = [
 ];
 
 export default function SecurityPage() {
+  const { contacts } = useAppStore();
+  const [dsar, setDsar] = useState<any[]>([]);
+  const [dsarContact, setDsarContact] = useState('');
+  const [dsarBusy, setDsarBusy] = useState('');
   const [plan, setPlan] = useState<PlanStatus | null>(null);
   const [platform, setPlatform] = useState<{ tenants: PlatformRow[]; totals: { tenants: number; mrr: number } } | null>(null);
   const [mfa, setMfa] = useState<{ enabled: boolean; backupCodesRemaining: number } | null>(null);
@@ -60,7 +65,41 @@ export default function SecurityPage() {
     else setPlatform(null);
   }, []);
 
-  useEffect(() => { void load(); }, [load]);
+  const loadDsar = useCallback(async () => {
+    const res = await apiFetch<{ items: any[] }>('/api/privacy/requests');
+    if (res.ok) setDsar(((res.data as any)?.items) || []);
+  }, []);
+
+  useEffect(() => { void load(); void loadDsar(); }, [load, loadDsar]);
+
+  /* Data subject requests — export produces a hashed JSON bundle; erasure
+     pseudonymizes identity while disclosing statutory retention. */
+  const runDsar = async (kind: 'export' | 'erasure') => {
+    if (!dsarContact) return;
+    if (kind === 'erasure' && !confirm('Erase this contact’s personal data? Tax records required by IRC §6107 are retained and disclosed in the receipt.')) return;
+    setDsarBusy(kind);
+    const res = await apiFetch<{ recordCount: number; retainedNote?: string; status: string }>('/api/privacy/requests', {
+      method: 'POST', body: JSON.stringify({ contactId: dsarContact, kind }),
+    });
+    const d: any = res.data || {};
+    if (res.ok) setMsg(kind === 'export'
+      ? `Export complete — ${d.recordCount} records, sha256 ${String(d.sha256).slice(0, 16)}…`
+      : `Erasure ${d.status}. ${d.retainedNote || ''}`);
+    else setErr(d.hint || d.error || 'Request failed.');
+    setDsarBusy('');
+    await loadDsar();
+  };
+
+  const downloadDsar = async (id: string) => {
+    const token = localStorage.getItem('tph_session_token') || '';
+    const res = await fetch(`/api/privacy/requests/${id}/download`, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+    if (!res.ok) return;
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `dsar-${id.slice(0, 8)}.json`; document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  };
 
   const startEnroll = async () => {
     setBusy(true); setErr(''); setMsg('');
@@ -236,6 +275,46 @@ export default function SecurityPage() {
                 </div>
               ))}
             </div>
+          </div>
+        )}
+      </div>
+
+      {/* Privacy / DSAR */}
+      <div className="bg-neutral-950/85 border border-[#D4AF37]/15 rounded-3xl p-6">
+        <h2 className="text-lg font-bold text-white flex items-center gap-2"><FileJson className="h-4 w-4 text-[#D4AF37]" /> Data subject requests</h2>
+        <p className="text-xs text-slate-400 mt-1">
+          Export produces a hash-sealed JSON bundle of everything linked to a client. Erasure pseudonymizes
+          identity and purges marketing data while retaining records required by IRC §6107(b).
+        </p>
+        <div className="flex items-end gap-3 mt-4 flex-wrap">
+          <div className="flex-1 min-w-[220px]">
+            <span className="text-[10px] uppercase tracking-wider text-slate-500 font-mono">Client</span>
+            <select value={dsarContact} onChange={(e) => setDsarContact(e.target.value)}
+              className="mt-1 w-full rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5 text-sm outline-none">
+              <option value="">Select…</option>
+              {contacts.map((c: any) => <option key={c.id} value={c.id}>{c.firstName} {c.lastName} — {c.email}</option>)}
+            </select>
+          </div>
+          <button onClick={() => runDsar('export')} disabled={!dsarContact || dsarBusy !== ''}
+            className="px-4 py-2.5 rounded-xl bg-sky-500/10 border border-sky-500/30 text-sky-300 text-[11px] font-black uppercase tracking-wider disabled:opacity-40 flex items-center gap-2">
+            {dsarBusy === 'export' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />} Export data
+          </button>
+          <button onClick={() => runDsar('erasure')} disabled={!dsarContact || dsarBusy !== ''}
+            className="px-4 py-2.5 rounded-xl bg-red-500/10 border border-red-500/30 text-red-300 text-[11px] font-black uppercase tracking-wider disabled:opacity-40 flex items-center gap-2">
+            {dsarBusy === 'erasure' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />} Erase
+          </button>
+        </div>
+        {dsar.length > 0 && (
+          <div className="mt-4 space-y-1.5">
+            {dsar.map((r) => (
+              <div key={r.id} className="flex items-center justify-between gap-3 text-[11px] font-mono border-b border-neutral-900 pb-1.5 last:border-0">
+                <span className="text-slate-300">{new Date(r.created_at).toLocaleString()} · {r.kind} · {r.records_count} records</span>
+                <span className="flex items-center gap-3">
+                  <span className={r.status === 'complete' ? 'text-emerald-400' : 'text-amber-400'}>{r.status}</span>
+                  <button onClick={() => downloadDsar(r.id)} className="text-[#D4AF37] hover:underline">download</button>
+                </span>
+              </div>
+            ))}
           </div>
         )}
       </div>

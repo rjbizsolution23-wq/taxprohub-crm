@@ -138,11 +138,51 @@ Functions) against **D1** with per-tenant isolation:
 Full audit & architecture: [`ANALYSIS.md`](./ANALYSIS.md) ·
 Deployment: [`docs/DEPLOYMENT_RUNBOOK.md`](./docs/DEPLOYMENT_RUNBOOK.md)
 
+## 🗂️ IRS E-FILE PIPELINE
+
+`/#/efile` tracks the real MeF lifecycle: **draft → ready → transmitted →
+accepted | rejected → perfected**, with hard compliance gates:
+
+* **Pub 1345 gate** — transmit returns `428 form_8879_not_signed` until the
+  taxpayer has actually e-signed Form 8879 in this system.
+* **EFIN gate** — `428 efin_missing` until a firm EFIN exists on a preparer record.
+* **No provider? No fiction.** Without `EFILE_PROVIDER_URL`/`KEY` the system runs
+  in manual mode: it arms tracking and tells you to transmit in your provider
+  software, then record the acknowledgement. Nothing is ever auto-marked accepted.
+* **Reject-code knowledge base** — 9 of the most common IRS business rules
+  (IND-031-04, IND-181-01, F1040-512, R0000-902-01, SEIC-F1040-501-02, F8962-070 …)
+  each with the published meaning and the actual fix.
+* A rejection opens an **urgent task carrying the statutory perfection deadline**
+  (5 days for 1040, 10 for entities), and a dedicated compliance agent escalates
+  it to `critical` once that window closes.
+
+## 🏦 BANK PRODUCTS (refund advance / RT)
+
+Applications, approvals, funding and settlement with fee math
+(`net = approved − prep fee − bank fee`) and a **disclosure gate**: funding
+returns `428 disclosure_required` unless a signed *Bank Product Disclosure and
+Consent* (a first-class e-sign template covering the "not required to purchase",
+fee-deduction and advance-is-a-loan language) exists for that client. A
+compliance agent flags any funded product missing its disclosure as `critical`.
+
+## 🔏 PRIVACY — EXPORT & RIGHT TO ERASURE
+
+`/#/security` → Data subject requests.
+
+* **Export** — hash-sealed JSON bundle of the contact plus every linked deal,
+  appointment, document, signature, invoice, submission, e-file record, bank
+  product and campaign touch; archived to R2.
+* **Erasure** — pseudonymizes identity (`Erased Contact`,
+  `erased+xxxx@redacted.invalid`), purges marketing submissions, campaign
+  history, portal sessions and tokens, cancels workflow runs — then reports
+  `partial_legal_hold` with an explicit note of what stays under **IRC §6107(b)**.
+  The receipt is the evidence; nothing silently disappears or silently survives.
+
 ## 🧪 TEST SUITE (CI-gated)
 
 ```bash
 npm run test:unit   # 11 vitest units — parser, filing, sync diff, formatting
-npm run test:api    # 81 assertions against a REAL edge stack
+npm run test:api    # 106 assertions against a REAL edge stack
 npm run test:all    # typecheck + both
 ```
 
@@ -153,7 +193,7 @@ campaign queues, workflow execution, e-signature ceremony + replay protection,
 invoicing, all 24 compliance agents, evidence bundle hashing, portal
 anti-enumeration, public intake + honeypot, payout runs, plan metering, TOTP
 (generated with an independent implementation), SSE streaming, and white-label
-domain claims. **Non-zero exit on any failure — the GitHub Actions job gates
+domain claims. **106/106 green · non-zero exit on any failure — the GitHub Actions job gates
 every deploy on it.**
 
 ## 🏷️ WHITE-LABEL STUDIO
@@ -317,6 +357,8 @@ dedupe across runs and **auto-resolve the moment the underlying data is fixed**.
 | Filing Deadline & SLA Watch | Circular 230 §10.22 |
 | Audit Trail Integrity | SOC 2 CC7.2 |
 | Backup & Continuity | Safeguards §314.4(h) |
+| E-file Rejection Perfection Window | IRS Pub 1345 |
+| Bank Product Disclosure Control | Reg Z; Circular 230 §10.27 |
 
 Score = `100 − (12×critical + 6×high + 3×medium + 1×low)`. Each finding ships a
 citation, a plain-English fix and a deep link to the exact record. Operators can
