@@ -138,6 +138,59 @@ Functions) against **D1** with per-tenant isolation:
 Full audit & architecture: [`ANALYSIS.md`](./ANALYSIS.md) ·
 Deployment: [`docs/DEPLOYMENT_RUNBOOK.md`](./docs/DEPLOYMENT_RUNBOOK.md)
 
+## 🛡️ COMPLIANCE COMMAND CENTER — 1 chief + 24 specialist agents
+
+`/#/compliance` — a Chief Compliance Orchestrator supervising **24 specialist
+agents**, each running a real query against the tenant's own D1 records on a
+daily cadence (plus on demand). Findings carry a stable fingerprint, so they
+dedupe across runs and **auto-resolve the moment the underlying data is fixed**.
+
+| Agent | Authority |
+|---|---|
+| Circular 230 Practice Standards | 31 CFR Part 10 |
+| PTIN / EFIN Registration | IRC §6109(a)(4), Pub 3112 |
+| Continuing Education Tracking | Circular 230 §10.6(e), AFSP |
+| WISP — Written Information Security Plan | IRS Pub 4557, 16 CFR 314 |
+| GLBA Safeguards Controls | GLBA, 16 CFR 314.4 |
+| Engagement Letter Coverage | AICPA SSTS No. 1 |
+| Refundable Credit Due Diligence | IRC §6695(g), Form 8867 |
+| TCPA / SMS Consent | 47 U.S.C. §227 |
+| CAN-SPAM Email Requirements | 15 U.S.C. §7704 |
+| CROA Credit-Repair Disclosures | 15 U.S.C. §1679 |
+| Beneficial Ownership (BOI) | CTA, 31 CFR 1010.380 |
+| Records Retention Schedule | IRC §6107(b) |
+| PII / SSN Exposure Scanner | FTC Safeguards, state breach law |
+| E-file Security Six | IRS Security Summit |
+| Large Cash / Form 8300 | IRC §6050I |
+| State Preparer Registration | CTEC / NYTPRIN / OBTP / MD / CT |
+| Privacy Notice & §7216 Consent | Treas. Reg. §301.7216-3 |
+| Incident Response Readiness | Safeguards §314.4(h), Pub 5293 |
+| Least-Privilege Access Review | Safeguards §314.4(c)(1), SOC 2 CC6.1 |
+| Client Portal Access Hygiene | Pub 4557 |
+| Secure Delivery Enforcement | Pub 4557, GLBA §314.4(c)(3) |
+| Filing Deadline & SLA Watch | Circular 230 §10.22 |
+| Audit Trail Integrity | SOC 2 CC7.2 |
+| Backup & Continuity | Safeguards §314.4(h) |
+
+Score = `100 − (12×critical + 6×high + 3×medium + 1×low)`. Each finding ships a
+citation, a plain-English fix and a deep link to the exact record. Operators can
+**Resolve** or **Waive** (waivers persist through re-sweeps with the reviewer's id).
+
+| Route | Purpose |
+|---|---|
+| `GET /api/compliance/overview` | chief + roster + open findings + sweep history |
+| `POST /api/compliance/run` | full sweep, or one agent via `{"agentKey":"can_spam"}` |
+| `PUT /api/compliance/findings/:id` | `resolved` / `waived` / reopen |
+
+The cron tick runs a sweep per tenant every 20 hours automatically.
+
+## 📡 LIVE STREAMING (Server-Sent Events)
+
+`GET /api/stream?token=…` pushes a practice snapshot every 5 seconds plus every
+audit event as it lands. `useLiveStream()` powers the live sidebar counters, the
+Compliance Center activity feed and the connection indicator. No polling, no
+fabricated telemetry — if the stream is down the UI says so.
+
 ## ⚙️ DELIVERY ENGINE (campaigns + workflows, durable at the edge)
 
 Campaigns and automations are **real queued jobs in D1**, not simulations:

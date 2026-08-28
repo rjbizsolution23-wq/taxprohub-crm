@@ -775,6 +775,7 @@ function health(env: Env) {
       kv_ledger: !!env.LEDGER,
       r2_document_vault: !!env.DOCS,
       cron_engine: !!env.CRON_SECRET,
+      compliance_agents: COMPLIANCE_AGENTS.length,
       twilio_sms: !!(env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && env.TWILIO_FROM_NUMBER),
       stripe: !!env.STRIPE_SECRET_KEY,
       stripe_webhooks: !!env.STRIPE_WEBHOOK_SECRET,
@@ -1265,7 +1266,19 @@ async function cronTick(env: Env, request: Request) {
     if (finished) result.workflowsCompleted++;
   }
 
-  return json({ ok: true, at: now, ...result });
+  /* ── daily compliance sweep (once per tenant per 20h) ── */
+  let complianceRuns = 0;
+  const tenants = await env.DB.prepare('SELECT id FROM tenants').all<Record<string, unknown>>();
+  for (const tn of tenants.results || []) {
+    const last = await env.DB.prepare('SELECT started_at FROM compliance_runs WHERE tenant_id = ? ORDER BY started_at DESC LIMIT 1')
+      .bind(tn.id).first<Record<string, unknown>>();
+    const dueAt = last?.started_at ? new Date(String(last.started_at)).getTime() + 20 * 3_600_000 : 0;
+    if (Date.now() >= dueAt) {
+      try { await runComplianceSweep(env, String(tn.id), 'cron'); complianceRuns++; } catch { /* keep the tick alive */ }
+    }
+  }
+
+  return json({ ok: true, at: now, ...result, complianceRuns });
 }
 
 /* ══════════════ CLIENT PORTAL — passwordless magic-link access ══════════════ */
@@ -1424,6 +1437,888 @@ async function portalDownload(env: Env, request: Request, id: string) {
   });
 }
 
+
+/* ═════════════ COMPLIANCE COMMAND CENTER — chief + 20 specialists ═════════════
+ * Every agent runs a real query against the tenant's own D1 records and emits
+ * deterministic findings (stable `fingerprint` → dedupe + auto-resolve).
+ * The chief orchestrator runs the roster, scores the practice and writes a run
+ * record. Nothing here is simulated: an empty practice scores 100 with 0 findings.
+ */
+
+interface Finding {
+  fingerprint: string;
+  severity: 'critical' | 'high' | 'medium' | 'low';
+  title: string;
+  detail: string;
+  entityType?: string;
+  entityId?: string;
+  remediation: string;
+  deepLink?: string;
+}
+
+interface AgentDef {
+  key: string;
+  name: string;
+  domain: string;
+  authority: string;
+  cadence: 'daily' | 'weekly' | 'monthly';
+  run: (db: D1Database, tenantId: string, env: Env) => Promise<Finding[]>;
+}
+
+const all = async (db: D1Database, sql: string, ...binds: unknown[]) =>
+  ((await db.prepare(sql).bind(...binds).all<Record<string, any>>()).results || []);
+
+const SSN_RE = /\b\d{3}-\d{2}-\d{4}\b/;
+const YEARS = (n: number) => new Date(Date.now() - n * 365.25 * 86400000).toISOString();
+
+const COMPLIANCE_AGENTS: AgentDef[] = [
+  {
+    key: 'circular230',
+    name: 'Circular 230 Practice Standards',
+    domain: 'Practitioner conduct',
+    authority: '31 CFR Part 10 (Treasury Circular 230)',
+    cadence: 'daily',
+    run: async (db, t) => {
+      const rows = await all(db, `SELECT id, first_name, last_name, circular230_status, status FROM preparers WHERE tenant_id = ?`, t);
+      return rows.filter((p) => p.status === 'active' && p.circular230_status !== 'verified').map((p) => ({
+        fingerprint: `circular230:unverified:${p.id}`,
+        severity: 'high' as const,
+        title: `${p.first_name} ${p.last_name} is not Circular 230 verified`,
+        detail: `Active preparer with circular230_status="${p.circular230_status || 'unset'}". Practitioners must satisfy Circular 230 duties before representing taxpayers.`,
+        entityType: 'preparer', entityId: String(p.id),
+        remediation: 'Confirm credentials (EA/CPA/attorney/AFSP) and set Circular 230 status to verified on the preparer record.',
+        deepLink: `#/preparers/${p.id}`,
+      }));
+    },
+  },
+  {
+    key: 'ptin_efin',
+    name: 'PTIN / EFIN Registration',
+    domain: 'Preparer registration',
+    authority: 'IRC §6109(a)(4); Rev. Proc. 2010-41; Pub 3112',
+    cadence: 'daily',
+    run: async (db, t) => {
+      const rows = await all(db, `SELECT id, first_name, last_name, ptin, efin, role, status FROM preparers WHERE tenant_id = ?`, t);
+      const out: Finding[] = [];
+      for (const p of rows) {
+        if (p.status !== 'active') continue;
+        const ptin = String(p.ptin || '');
+        if (!ptin) {
+          out.push({
+            fingerprint: `ptin:missing:${p.id}`, severity: 'critical',
+            title: `${p.first_name} ${p.last_name} has no PTIN on file`,
+            detail: 'Anyone paid to prepare federal returns must hold a current PTIN.',
+            entityType: 'preparer', entityId: String(p.id),
+            remediation: 'Record the preparer’s current-year PTIN (format P########).',
+            deepLink: `#/preparers/${p.id}`,
+          });
+        } else if (!/^P\d{8}$/.test(ptin)) {
+          out.push({
+            fingerprint: `ptin:malformed:${p.id}`, severity: 'medium',
+            title: `PTIN format looks invalid for ${p.first_name} ${p.last_name}`,
+            detail: `Stored value "${ptin}" does not match the P######## pattern.`,
+            entityType: 'preparer', entityId: String(p.id),
+            remediation: 'Correct the PTIN on the preparer record.',
+            deepLink: `#/preparers/${p.id}`,
+          });
+        }
+      }
+      const efinHolders = rows.filter((p) => String(p.efin || '').length > 0);
+      if (rows.length > 0 && efinHolders.length === 0) {
+        out.push({
+          fingerprint: 'efin:none-on-file', severity: 'high',
+          title: 'No EFIN recorded for the practice',
+          detail: 'E-filing more than 10 returns requires an Electronic Filing Identification Number.',
+          remediation: 'Add the firm’s EFIN to the responsible official’s preparer record.',
+          deepLink: '#/preparers',
+        });
+      }
+      return out;
+    },
+  },
+  {
+    key: 'ce_credits',
+    name: 'Continuing Education Tracking',
+    domain: 'Credential maintenance',
+    authority: 'Circular 230 §10.6(e); AFSP Rev. Proc. 2014-42',
+    cadence: 'weekly',
+    run: async (db, t) => {
+      const rows = await all(db, `SELECT id, first_name, last_name, ce_credits, role, status FROM preparers WHERE tenant_id = ?`, t);
+      return rows.filter((p) => p.status === 'active' && Number(p.ce_credits || 0) < 15).map((p) => ({
+        fingerprint: `ce:below-threshold:${p.id}`,
+        severity: Number(p.ce_credits || 0) === 0 ? ('high' as const) : ('medium' as const),
+        title: `${p.first_name} ${p.last_name} is below the CE threshold (${Number(p.ce_credits || 0)} hrs)`,
+        detail: 'AFSP requires 18 hours; EAs require 72 hours over three years with a 16-hour annual minimum. 15 hours is the platform warning floor.',
+        entityType: 'preparer', entityId: String(p.id),
+        remediation: 'Log completed CE certificates and update the preparer’s credit total before filing season.',
+        deepLink: `#/preparers/${p.id}`,
+      }));
+    },
+  },
+  {
+    key: 'wisp_4557',
+    name: 'WISP — Written Information Security Plan',
+    domain: 'Data security plan',
+    authority: 'IRS Pub 4557; FTC Safeguards Rule 16 CFR 314',
+    cadence: 'monthly',
+    run: async (db, t) => {
+      const rows = await all(db, `SELECT id, name, created_at FROM files WHERE tenant_id = ? AND (lower(name) LIKE '%wisp%' OR lower(doc_type) LIKE '%wisp%' OR lower(name) LIKE '%security plan%')`, t);
+      if (rows.length === 0) {
+        return [{
+          fingerprint: 'wisp:missing', severity: 'critical',
+          title: 'No Written Information Security Plan on file',
+          detail: 'Every paid preparer must create, maintain and follow a WISP. Absence is an FTC Safeguards violation and blocks PTIN renewal attestation.',
+          remediation: 'Upload the signed WISP to the document vault (name it "WISP <year>").',
+          deepLink: '#/documents',
+        }];
+      }
+      const newest = rows.map((r) => String(r.created_at)).sort().pop()!;
+      if (newest < YEARS(1)) {
+        return [{
+          fingerprint: 'wisp:stale', severity: 'high',
+          title: 'WISP has not been reviewed in over 12 months',
+          detail: `Most recent WISP document dates from ${new Date(newest).toLocaleDateString()}. Annual review and update is required.`,
+          remediation: 'Review, re-date and re-upload the WISP; record the review in the vault.',
+          deepLink: '#/documents',
+        }];
+      }
+      return [];
+    },
+  },
+  {
+    key: 'glba_safeguards',
+    name: 'GLBA Safeguards Controls',
+    domain: 'Technical safeguards',
+    authority: 'Gramm-Leach-Bliley Act; 16 CFR 314.4',
+    cadence: 'daily',
+    run: async (_db, _t, env) => {
+      const out: Finding[] = [];
+      if (!env.SESSION_SECRET) out.push({
+        fingerprint: 'glba:no-session-pepper', severity: 'high',
+        title: 'Password hashing pepper (SESSION_SECRET) is not configured',
+        detail: 'Safeguards Rule requires encryption of customer information and secure authentication. Without SESSION_SECRET, password hashes lack a server-side pepper.',
+        remediation: 'wrangler pages secret put SESSION_SECRET (long random value), then redeploy.',
+        deepLink: '#/settings',
+      });
+      if (!env.DOCS) out.push({
+        fingerprint: 'glba:no-encrypted-vault', severity: 'high',
+        title: 'Encrypted document vault (R2) is not provisioned',
+        detail: 'Client documents must be stored with access controls and encryption at rest.',
+        remediation: 'Run npm run cf:setup to create the R2 bucket and bind it as DOCS.',
+        deepLink: '#/settings',
+      });
+      return out;
+    },
+  },
+  {
+    key: 'engagement_letters',
+    name: 'Engagement Letter Coverage',
+    domain: 'Client agreements',
+    authority: 'AICPA SSTS No. 1; malpractice-carrier requirement',
+    cadence: 'daily',
+    run: async (db, t) => {
+      const deals = await all(db, `SELECT d.id, d.name, d.contact_id, d.stage_id, d.value FROM deals d WHERE d.tenant_id = ? AND d.value > 0`, t);
+      const out: Finding[] = [];
+      for (const d of deals) {
+        if (!d.contact_id) continue;
+        const letters = await all(db, `SELECT id FROM files WHERE tenant_id = ? AND contact_id = ? AND (lower(name) LIKE '%engagement%' OR lower(doc_type) LIKE '%engagement%')`, t, d.contact_id);
+        if (letters.length === 0) {
+          out.push({
+            fingerprint: `engagement:missing:${d.id}`, severity: 'high',
+            title: `No engagement letter for "${d.name}"`,
+            detail: `Billable engagement worth $${Number(d.value || 0).toLocaleString()} has no signed engagement letter in the vault.`,
+            entityType: 'deal', entityId: String(d.id),
+            remediation: 'Generate and countersign the engagement letter, then upload it against the client record.',
+            deepLink: `#/contacts/${d.contact_id}`,
+          });
+        }
+      }
+      return out;
+    },
+  },
+  {
+    key: 'due_diligence_8867',
+    name: 'Refundable Credit Due Diligence',
+    domain: 'EITC / CTC / AOTC / HOH',
+    authority: 'IRC §6695(g); Form 8867; Treas. Reg. §1.6695-2',
+    cadence: 'daily',
+    run: async (db, t) => {
+      const deals = await all(db, `SELECT id, name, contact_id, tags FROM deals WHERE tenant_id = ?`, t);
+      const flagged = deals.filter((d) => /eitc|ctc|aotc|hoh|head of household|child tax/i.test(String(d.tags || '') + ' ' + String(d.name || '')));
+      const out: Finding[] = [];
+      for (const d of flagged) {
+        const docs = await all(db, `SELECT id FROM files WHERE tenant_id = ? AND contact_id = ? AND (lower(name) LIKE '%8867%' OR lower(doc_type) LIKE '%8867%' OR lower(name) LIKE '%due diligence%')`, t, d.contact_id);
+        if (docs.length === 0) {
+          out.push({
+            fingerprint: `8867:missing:${d.id}`, severity: 'critical',
+            title: `Form 8867 checklist missing for "${d.name}"`,
+            detail: 'Refundable-credit returns require a completed Form 8867 and retained substantiation. Penalty is $600 per credit per return (indexed).',
+            entityType: 'deal', entityId: String(d.id),
+            remediation: 'Complete Form 8867, retain the substantiating documents, and upload both to the client vault.',
+            deepLink: `#/contacts/${d.contact_id}`,
+          });
+        }
+      }
+      return out;
+    },
+  },
+  {
+    key: 'tcpa_sms',
+    name: 'TCPA / SMS Consent',
+    domain: 'Outbound messaging',
+    authority: '47 U.S.C. §227; 47 CFR 64.1200; CTIA guidelines',
+    cadence: 'daily',
+    run: async (db, t) => {
+      const rows = await all(db, `SELECT id, first_name, last_name, phone, tags FROM contacts WHERE tenant_id = ? AND phone IS NOT NULL AND phone != ''`, t);
+      const unconsented = rows.filter((c) => !/consent|opt-?in|sms-ok/i.test(String(c.tags || '')));
+      if (unconsented.length === 0) return [];
+      return [{
+        fingerprint: 'tcpa:missing-consent-cohort', severity: 'high',
+        title: `${unconsented.length} contact${unconsented.length === 1 ? '' : 's'} have a phone number but no recorded SMS consent`,
+        detail: 'Prior express written consent is required before sending marketing SMS. Statutory damages run $500–$1,500 per message.',
+        entityType: 'contacts', entityId: unconsented.slice(0, 25).map((c) => c.id).join(','),
+        remediation: 'Capture opt-in through a form or portal checkbox and tag the contact "SMS-Consent" before including them in SMS campaigns.',
+        deepLink: '#/contacts',
+      }];
+    },
+  },
+  {
+    key: 'can_spam',
+    name: 'CAN-SPAM Email Requirements',
+    domain: 'Email marketing',
+    authority: '15 U.S.C. §7704; 16 CFR Part 316',
+    cadence: 'daily',
+    run: async (db, t) => {
+      const rows = await all(db, `SELECT id, name, type, content FROM campaigns WHERE tenant_id = ? AND type IN ('email','both')`, t);
+      const out: Finding[] = [];
+      for (const c of rows) {
+        const body = String(c.content || '').toLowerCase();
+        const missing: string[] = [];
+        if (!/unsubscribe|opt.?out|manage preferences/.test(body)) missing.push('unsubscribe mechanism');
+        if (!/\b\d{1,6}\s+[\w.]+\s+(st|street|ave|avenue|rd|road|blvd|hwy|nm|suite|ste)\b/i.test(String(c.content || ''))) missing.push('physical postal address');
+        if (missing.length) {
+          out.push({
+            fingerprint: `canspam:${c.id}`, severity: 'high',
+            title: `Campaign "${c.name}" is missing ${missing.join(' and ')}`,
+            detail: 'Every commercial email must include a clear opt-out mechanism and the sender’s valid physical postal address. Penalties reach $53,088 per email.',
+            entityType: 'campaign', entityId: String(c.id),
+            remediation: 'Add an unsubscribe link and the firm’s mailing address to the campaign footer before sending.',
+            deepLink: `#/campaigns/${c.id}`,
+          });
+        }
+      }
+      return out;
+    },
+  },
+  {
+    key: 'croa_credit_repair',
+    name: 'CROA Credit-Repair Disclosures',
+    domain: 'Credit repair services',
+    authority: 'Credit Repair Organizations Act, 15 U.S.C. §1679',
+    cadence: 'daily',
+    run: async (db, t) => {
+      const rows = await all(db, `SELECT id, name, contact_id, tags, croa_disclosure_sent, cancellation_window_status FROM deals WHERE tenant_id = ?`, t);
+      const credit = rows.filter((d) => /credit|dispute|croa|score/i.test(String(d.tags || '') + ' ' + String(d.name || '')));
+      const out: Finding[] = [];
+      for (const d of credit) {
+        if (!Number(d.croa_disclosure_sent)) out.push({
+          fingerprint: `croa:disclosure:${d.id}`, severity: 'critical',
+          title: `CROA disclosure not sent for "${d.name}"`,
+          detail: '"Consumer Credit File Rights Under State and Federal Law" must be delivered in writing before any contract is signed. Contracts without it are void.',
+          entityType: 'deal', entityId: String(d.id),
+          remediation: 'Send the CROA disclosure statement, obtain the signed acknowledgment, and mark the disclosure flag on the deal.',
+          deepLink: `#/credit-repair`,
+        });
+        if (!String(d.cancellation_window_status || '')) out.push({
+          fingerprint: `croa:cancellation:${d.id}`, severity: 'high',
+          title: `3-day cancellation window not tracked for "${d.name}"`,
+          detail: 'Consumers may cancel without penalty within 3 business days; no fee may be collected before services are fully performed.',
+          entityType: 'deal', entityId: String(d.id),
+          remediation: 'Record the cancellation-window status and hold billing until it closes.',
+          deepLink: `#/credit-repair`,
+        });
+      }
+      return out;
+    },
+  },
+  {
+    key: 'boi_fincen',
+    name: 'Beneficial Ownership (BOI) Reporting',
+    domain: 'Entity clients',
+    authority: 'Corporate Transparency Act; 31 CFR 1010.380',
+    cadence: 'weekly',
+    run: async (db, t) => {
+      const rows = await all(db, `SELECT id, first_name, last_name, company, tags FROM contacts WHERE tenant_id = ? AND company IS NOT NULL AND company != ''`, t);
+      const entities = rows.filter((c) => /llc|inc|corp|ltd|lp\b|pllc/i.test(String(c.company || '')));
+      const untracked = entities.filter((c) => !/boi|fincen|beneficial/i.test(String(c.tags || '')));
+      if (!untracked.length) return [];
+      return [{
+        fingerprint: 'boi:untracked-cohort', severity: 'medium',
+        title: `${untracked.length} entity client${untracked.length === 1 ? '' : 's'} have no BOI reporting status`,
+        detail: 'Reporting companies must file beneficial ownership information with FinCEN. Track filing status even when the firm does not prepare the report.',
+        entityType: 'contacts', entityId: untracked.slice(0, 25).map((c) => c.id).join(','),
+        remediation: 'Tag each entity client with BOI-Filed, BOI-Exempt or BOI-Pending after confirming its status.',
+        deepLink: '#/contacts',
+      }];
+    },
+  },
+  {
+    key: 'data_retention',
+    name: 'Records Retention Schedule',
+    domain: 'Document lifecycle',
+    authority: 'IRC §6107(b); Pub 4557 retention guidance',
+    cadence: 'weekly',
+    run: async (db, t) => {
+      const rows = await all(db, `SELECT id, name, created_at FROM files WHERE tenant_id = ? AND created_at < ?`, t, YEARS(7));
+      if (!rows.length) return [];
+      return [{
+        fingerprint: 'retention:past-schedule', severity: 'medium',
+        title: `${rows.length} document${rows.length === 1 ? '' : 's'} exceed the 7-year retention schedule`,
+        detail: 'Records past their retention period should be securely destroyed unless a legal hold applies — retaining PII longer than necessary increases breach exposure.',
+        entityType: 'files', entityId: rows.slice(0, 25).map((r) => r.id).join(','),
+        remediation: 'Review the listed documents, apply legal holds where required, and securely delete the remainder from the vault.',
+        deepLink: '#/documents',
+      }];
+    },
+  },
+  {
+    key: 'pii_exposure',
+    name: 'PII / SSN Exposure Scanner',
+    domain: 'Sensitive data hygiene',
+    authority: 'FTC Safeguards Rule; state breach statutes',
+    cadence: 'daily',
+    run: async (db, t) => {
+      const out: Finding[] = [];
+      const contacts = await all(db, `SELECT id, first_name, last_name, notes, custom_fields FROM contacts WHERE tenant_id = ?`, t);
+      for (const c of contacts) {
+        const blob = `${c.notes || ''} ${c.custom_fields || ''}`;
+        if (SSN_RE.test(blob)) out.push({
+          fingerprint: `pii:ssn-in-notes:${c.id}`, severity: 'critical',
+          title: `Possible SSN stored in free-text notes for ${c.first_name} ${c.last_name}`,
+          detail: 'Taxpayer identification numbers must not live in unstructured notes; they belong in encrypted document storage or a masked field.',
+          entityType: 'contact', entityId: String(c.id),
+          remediation: 'Remove the identifier from notes and store the source document in the encrypted vault instead.',
+          deepLink: `#/contacts/${c.id}`,
+        });
+      }
+      const campaigns = await all(db, `SELECT id, name, content FROM campaigns WHERE tenant_id = ?`, t);
+      for (const c of campaigns) {
+        if (SSN_RE.test(String(c.content || ''))) out.push({
+          fingerprint: `pii:ssn-in-campaign:${c.id}`, severity: 'critical',
+          title: `Possible SSN inside campaign "${c.name}"`,
+          detail: 'Marketing content containing taxpayer identifiers would transmit PII in cleartext email/SMS.',
+          entityType: 'campaign', entityId: String(c.id),
+          remediation: 'Strip the identifier from the campaign body immediately and rotate any exposed data.',
+          deepLink: `#/campaigns/${c.id}`,
+        });
+      }
+      return out;
+    },
+  },
+  {
+    key: 'efile_security',
+    name: 'E-file Security Six',
+    domain: 'Endpoint & transmission security',
+    authority: 'IRS Security Summit "Security Six"; Pub 4557',
+    cadence: 'monthly',
+    run: async (db, t, env) => {
+      const out: Finding[] = [];
+      if (!env.LEDGER) out.push({
+        fingerprint: 'efile:no-audit-ledger', severity: 'medium',
+        title: 'Durable audit ledger (KV) not bound',
+        detail: 'Security Six requires activity logging that survives application restarts.',
+        remediation: 'Bind the LEDGER KV namespace via npm run cf:setup.',
+        deepLink: '#/settings',
+      });
+      const keys = await all(db, `SELECT id, created_at FROM api_keys WHERE tenant_id = ?`, t);
+      const stale = keys.filter((k) => String(k.created_at) < YEARS(1));
+      if (stale.length) out.push({
+        fingerprint: 'efile:stale-api-keys', severity: 'medium',
+        title: `${stale.length} API key${stale.length === 1 ? '' : 's'} older than 12 months`,
+        detail: 'Long-lived credentials should be rotated at least annually.',
+        entityType: 'api_keys', entityId: stale.map((k) => k.id).join(','),
+        remediation: 'Rotate the listed API keys and revoke the old values.',
+        deepLink: '#/developer',
+      });
+      return out;
+    },
+  },
+  {
+    key: 'aml_form8300',
+    name: 'Large Cash / Form 8300',
+    domain: 'AML reporting',
+    authority: 'IRC §6050I; 31 U.S.C. §5331; Form 8300',
+    cadence: 'daily',
+    run: async (db, t) => {
+      const rows = await all(db, `SELECT id, name, value, tags FROM deals WHERE tenant_id = ? AND value >= 10000`, t);
+      const cash = rows.filter((d) => /cash|wire|money order|cashier/i.test(String(d.tags || '')));
+      return cash.filter((d) => !/8300|reported/i.test(String(d.tags || ''))).map((d) => ({
+        fingerprint: `aml:8300:${d.id}`, severity: 'high' as const,
+        title: `Form 8300 may be required for "${d.name}"`,
+        detail: `Cash-tagged transaction of $${Number(d.value).toLocaleString()} meets or exceeds the $10,000 reporting threshold. Filing is due within 15 days of receipt.`,
+        entityType: 'deal', entityId: String(d.id),
+        remediation: 'File Form 8300 with FinCEN, notify the payer by January 31, and tag the deal "8300-Reported".',
+        deepLink: '#/pipelines',
+      }));
+    },
+  },
+  {
+    key: 'state_registration',
+    name: 'State Preparer Registration',
+    domain: 'State licensing',
+    authority: 'CA CTEC, NY NYTPRIN, OR Board of Tax Practitioners, MD, CT',
+    cadence: 'monthly',
+    run: async (db, t) => {
+      const rows = await all(db, `SELECT id, first_name, last_name, credentials, status FROM preparers WHERE tenant_id = ? AND status = 'active'`, t);
+      return rows.filter((p) => {
+        const creds = String(p.credentials || '').toUpperCase();
+        return !/CTEC|NYTPRIN|OBTP|CPA|EA|ATTORNEY|BAR/.test(creds);
+      }).map((p) => ({
+        fingerprint: `state:registration:${p.id}`, severity: 'medium' as const,
+        title: `${p.first_name} ${p.last_name} has no state registration or federal credential recorded`,
+        detail: 'CA, NY, OR, MD and CT require state registration for unenrolled preparers. Record CTEC/NYTPRIN/OBTP numbers or the federal credential that exempts them.',
+        entityType: 'preparer', entityId: String(p.id),
+        remediation: 'Add the state registration number (or CPA/EA/attorney credential) to the preparer record.',
+        deepLink: `#/preparers/${p.id}`,
+      }));
+    },
+  },
+  {
+    key: 'privacy_notice',
+    name: 'Privacy Notice & §7216 Consent',
+    domain: 'Disclosure consent',
+    authority: 'IRC §7216; Treas. Reg. §301.7216-3; GLBA privacy notice',
+    cadence: 'monthly',
+    run: async (db, t) => {
+      const docs = await all(db, `SELECT id FROM files WHERE tenant_id = ? AND (lower(name) LIKE '%privacy%' OR lower(doc_type) LIKE '%privacy%' OR lower(name) LIKE '%7216%')`, t);
+      if (docs.length) return [];
+      return [{
+        fingerprint: 'privacy:no-notice', severity: 'high',
+        title: 'No privacy notice or §7216 consent template on file',
+        detail: 'Using or disclosing taxpayer return information for anything beyond preparation requires prior written consent in the §7216 format. A GLBA privacy notice must also be provided annually.',
+        remediation: 'Upload the firm privacy notice and the §7216 consent template to the vault, and attach the consent to marketing intake.',
+        deepLink: '#/documents',
+      }];
+    },
+  },
+  {
+    key: 'breach_response',
+    name: 'Incident Response Readiness',
+    domain: 'Breach preparedness',
+    authority: 'FTC Safeguards §314.4(h); IRS Pub 5293',
+    cadence: 'monthly',
+    run: async (db, t) => {
+      const out: Finding[] = [];
+      const plan = await all(db, `SELECT id FROM files WHERE tenant_id = ? AND (lower(name) LIKE '%incident%' OR lower(name) LIKE '%breach%' OR lower(doc_type) LIKE '%incident%')`, t);
+      if (!plan.length) out.push({
+        fingerprint: 'breach:no-plan', severity: 'high',
+        title: 'No documented incident response plan',
+        detail: 'The Safeguards Rule requires a written incident response plan naming who reports a breach to the IRS Stakeholder Liaison, state agencies and affected clients.',
+        remediation: 'Upload the incident response plan (name it "Incident Response Plan <year>").',
+        deepLink: '#/documents',
+      });
+      const fails = await all(db, `SELECT COUNT(*) AS n FROM audit_logs WHERE tenant_id = ? AND action LIKE '%failed%' AND created_at > ?`, t, new Date(Date.now() - 86400000).toISOString());
+      const n = Number(fails[0]?.n || 0);
+      if (n >= 10) out.push({
+        fingerprint: 'breach:auth-anomaly', severity: 'high',
+        title: `${n} failed authentication events in the last 24 hours`,
+        detail: 'Elevated failure volume can indicate credential stuffing against the practice portal.',
+        remediation: 'Review the audit log, rotate exposed credentials and consider enabling IP throttling.',
+        deepLink: '#/settings',
+      });
+      return out;
+    },
+  },
+  {
+    key: 'access_review',
+    name: 'Least-Privilege Access Review',
+    domain: 'Identity governance',
+    authority: 'FTC Safeguards §314.4(c)(1); SOC 2 CC6.1',
+    cadence: 'monthly',
+    run: async (db, t) => {
+      const out: Finding[] = [];
+      const admins = await all(db, `SELECT id, email, role, created_at FROM users WHERE tenant_id = ? AND role = 'admin'`, t);
+      if (admins.length > 3) out.push({
+        fingerprint: 'access:too-many-admins', severity: 'medium',
+        title: `${admins.length} accounts hold full admin rights`,
+        detail: 'Administrative access should be limited to the smallest workable group and reviewed periodically.',
+        entityType: 'users', entityId: admins.map((u) => u.id).join(','),
+        remediation: 'Downgrade non-essential admins to preparer or staff roles.',
+        deepLink: '#/settings',
+      });
+      const stale = await all(db, `SELECT id, user_id, created_at FROM sessions WHERE tenant_id = ? AND expires_at < ?`, t, nowIso());
+      if (stale.length > 50) out.push({
+        fingerprint: 'access:stale-sessions', severity: 'low',
+        title: `${stale.length} expired sessions have not been purged`,
+        detail: 'Expired session rows should be cleared on a schedule to limit residual data.',
+        remediation: 'Run the session cleanup (the cron tick prunes them automatically once enabled).',
+        deepLink: '#/settings',
+      });
+      return out;
+    },
+  },
+  {
+    key: 'client_portal_security',
+    name: 'Client Portal Access Hygiene',
+    domain: 'Portal security',
+    authority: 'Pub 4557 secure client communication',
+    cadence: 'daily',
+    run: async (db, t) => {
+      const out: Finding[] = [];
+      const openTokens = await all(db, `SELECT id, created_at FROM portal_tokens WHERE tenant_id = ? AND used_at IS NULL AND expires_at > ?`, t, nowIso());
+      if (openTokens.length > 25) out.push({
+        fingerprint: 'portal:token-flood', severity: 'medium',
+        title: `${openTokens.length} unused portal sign-in links are outstanding`,
+        detail: 'A large pool of live magic links widens the window for interception.',
+        remediation: 'Investigate the source of link requests; expire unused links if the volume is unexpected.',
+        deepLink: '#/settings',
+      });
+      const emailless = await all(db, `SELECT COUNT(*) AS n FROM contacts WHERE tenant_id = ? AND (email IS NULL OR email = '')`, t);
+      const n = Number(emailless[0]?.n || 0);
+      if (n > 0) out.push({
+        fingerprint: 'portal:no-email-cohort', severity: 'low',
+        title: `${n} client${n === 1 ? '' : 's'} cannot use the secure portal (no email on file)`,
+        detail: 'Clients without an email address are likely receiving documents through less secure channels.',
+        remediation: 'Collect email addresses so document exchange happens inside the encrypted portal.',
+        deepLink: '#/contacts',
+      });
+      return out;
+    },
+  },
+  {
+    key: 'unsecured_delivery',
+    name: 'Secure Delivery Enforcement',
+    domain: 'Document transmission',
+    authority: 'Pub 4557; GLBA §314.4(c)(3)',
+    cadence: 'daily',
+    run: async (db, t) => {
+      const rows = await all(db, `SELECT id, name, content FROM campaigns WHERE tenant_id = ?`, t);
+      const risky = rows.filter((c) => /attach(ed|ment)|see attached|pdf attached/i.test(String(c.content || '')));
+      return risky.map((c) => ({
+        fingerprint: `delivery:attachment:${c.id}`, severity: 'medium' as const,
+        title: `Campaign "${c.name}" references emailed attachments`,
+        detail: 'Taxpayer documents should be exchanged through the encrypted portal rather than email attachments.',
+        entityType: 'campaign', entityId: String(c.id),
+        remediation: 'Replace attachment language with a secure portal link.',
+        deepLink: `#/campaigns/${c.id}`,
+      }));
+    },
+  },
+  {
+    key: 'sla_deadlines',
+    name: 'Filing Deadline & SLA Watch',
+    domain: 'Engagement timeliness',
+    authority: 'Circular 230 §10.22 (diligence as to accuracy)',
+    cadence: 'daily',
+    run: async (db, t) => {
+      const rows = await all(db, `SELECT id, name, days_in_stage, sla_days, contact_id FROM deals WHERE tenant_id = ? AND sla_days > 0`, t);
+      return rows.filter((d) => Number(d.days_in_stage || 0) > Number(d.sla_days || 0)).map((d) => ({
+        fingerprint: `sla:breach:${d.id}`, severity: 'medium' as const,
+        title: `"${d.name}" has exceeded its SLA (${d.days_in_stage}d in stage vs ${d.sla_days}d target)`,
+        detail: 'Stalled engagements risk missed deadlines and diligence findings.',
+        entityType: 'deal', entityId: String(d.id),
+        remediation: 'Advance the engagement or reset expectations with the client in writing.',
+        deepLink: '#/pipelines',
+      }));
+    },
+  },
+  {
+    key: 'audit_trail',
+    name: 'Audit Trail Integrity',
+    domain: 'Evidence & logging',
+    authority: 'SOC 2 CC7.2; Safeguards §314.4(d)',
+    cadence: 'daily',
+    run: async (db, t) => {
+      const rows = await all(db, `SELECT COUNT(*) AS n FROM audit_logs WHERE tenant_id = ? AND created_at > ?`, t, new Date(Date.now() - 7 * 86400000).toISOString());
+      const writes = await all(db, `SELECT COUNT(*) AS n FROM contacts WHERE tenant_id = ? AND updated_at > ?`, t, new Date(Date.now() - 7 * 86400000).toISOString());
+      if (Number(writes[0]?.n || 0) > 0 && Number(rows[0]?.n || 0) === 0) {
+        return [{
+          fingerprint: 'audit:no-events', severity: 'high',
+          title: 'Records changed this week but no audit events were written',
+          detail: 'Audit logging appears to be failing, which breaks evidence requirements for breach investigations.',
+          remediation: 'Verify the D1 binding and that audit_logs writes are succeeding.',
+          deepLink: '#/settings',
+        }];
+      }
+      return [];
+    },
+  },
+  {
+    key: 'backup_continuity',
+    name: 'Backup & Continuity',
+    domain: 'Business continuity',
+    authority: 'Safeguards §314.4(h); Pub 4557 continuity guidance',
+    cadence: 'weekly',
+    run: async (db, t, env) => {
+      const out: Finding[] = [];
+      if (!env.DOCS) out.push({
+        fingerprint: 'continuity:no-object-store', severity: 'high',
+        title: 'No durable object store bound for document backups',
+        detail: 'Client files must survive a workstation loss.',
+        remediation: 'Provision R2 (npm run cf:setup) so documents are stored off-device.',
+        deepLink: '#/settings',
+      });
+      const docCount = await all(db, `SELECT COUNT(*) AS n FROM files WHERE tenant_id = ?`, t);
+      const contactCount = await all(db, `SELECT COUNT(*) AS n FROM contacts WHERE tenant_id = ?`, t);
+      if (Number(contactCount[0]?.n || 0) >= 10 && Number(docCount[0]?.n || 0) === 0) out.push({
+        fingerprint: 'continuity:no-documents', severity: 'medium',
+        title: 'Client roster exists but no documents are stored in the vault',
+        detail: 'Documents are likely living on local drives or in email, outside backup and access control.',
+        remediation: 'Migrate client documents into the encrypted vault.',
+        deepLink: '#/documents',
+      });
+      return out;
+    },
+  },
+];
+
+const SEVERITY_WEIGHT: Record<string, number> = { critical: 12, high: 6, medium: 3, low: 1 };
+
+/** Ensure the 20-agent roster exists for this tenant (idempotent). */
+async function ensureComplianceRoster(env: Env, tenantId: string) {
+  const now = nowIso();
+  const stmt = env.DB!.prepare(
+    `INSERT INTO compliance_agents (id, tenant_id, agent_key, name, domain, authority, cadence, status, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+     ON CONFLICT(tenant_id, agent_key) DO UPDATE SET name = excluded.name, domain = excluded.domain,
+       authority = excluded.authority, cadence = excluded.cadence, updated_at = excluded.updated_at`,
+  );
+  await env.DB!.batch(COMPLIANCE_AGENTS.map((a) =>
+    stmt.bind(uuid(), tenantId, a.key, a.name, a.domain, a.authority, a.cadence, now, now)));
+}
+
+/** Chief Compliance Orchestrator — runs the roster and reconciles findings. */
+async function runComplianceSweep(env: Env, tenantId: string, trigger: 'manual' | 'cron' = 'manual', onlyAgent?: string) {
+  const db = env.DB!;
+  await ensureComplianceRoster(env, tenantId);
+
+  const runId = uuid();
+  const startedAt = nowIso();
+  const roster = onlyAgent ? COMPLIANCE_AGENTS.filter((a) => a.key === onlyAgent) : COMPLIANCE_AGENTS;
+
+  await db.prepare(
+    `INSERT INTO compliance_runs (id, tenant_id, trigger, started_at, agents_run) VALUES (?, ?, ?, ?, 0)`,
+  ).bind(runId, tenantId, trigger, startedAt).run();
+
+  const seen = new Set<string>();
+  let opened = 0;
+  const perAgent: Record<string, number> = {};
+
+  for (const agent of roster) {
+    const t0 = Date.now();
+    let findings: Finding[] = [];
+    try {
+      findings = await agent.run(db, tenantId, env);
+    } catch (e) {
+      findings = [{
+        fingerprint: `agent-error:${agent.key}`,
+        severity: 'low',
+        title: `${agent.name} could not complete its check`,
+        detail: String(e).slice(0, 240),
+        remediation: 'Re-run the sweep; if it persists the underlying table may be missing a migration.',
+      }];
+    }
+
+    for (const f of findings) {
+      seen.add(f.fingerprint);
+      const existing = await db.prepare('SELECT id, status FROM compliance_findings WHERE tenant_id = ? AND fingerprint = ?')
+        .bind(tenantId, f.fingerprint).first<Record<string, unknown>>();
+      if (existing) {
+        await db.prepare(
+          `UPDATE compliance_findings SET last_seen = ?, severity = ?, title = ?, detail = ?, remediation = ?, deep_link = ?,
+             status = CASE WHEN status = 'waived' THEN 'waived' ELSE 'open' END WHERE id = ?`,
+        ).bind(nowIso(), f.severity, f.title, f.detail, f.remediation, f.deepLink || '', existing.id).run();
+      } else {
+        opened++;
+        await db.prepare(
+          `INSERT INTO compliance_findings (id, tenant_id, agent_key, fingerprint, severity, title, detail, authority,
+             entity_type, entity_id, remediation, deep_link, status, first_seen, last_seen)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`,
+        ).bind(uuid(), tenantId, agent.key, f.fingerprint, f.severity, f.title, f.detail, agent.authority,
+          f.entityType || '', f.entityId || '', f.remediation, f.deepLink || '', nowIso(), nowIso()).run();
+      }
+    }
+
+    perAgent[agent.key] = findings.length;
+    await db.prepare(
+      `UPDATE compliance_agents SET last_run_at = ?, last_duration_ms = ?, open_findings = ?, checks_run = checks_run + 1, updated_at = ?
+       WHERE tenant_id = ? AND agent_key = ?`,
+    ).bind(nowIso(), Date.now() - t0, findings.length, nowIso(), tenantId, agent.key).run();
+  }
+
+  // Auto-resolve anything the agents no longer report (full sweeps only).
+  let resolved = 0;
+  if (!onlyAgent) {
+    const open = await db.prepare(`SELECT id, fingerprint FROM compliance_findings WHERE tenant_id = ? AND status = 'open'`)
+      .bind(tenantId).all<Record<string, unknown>>();
+    for (const row of open.results || []) {
+      if (!seen.has(String(row.fingerprint))) {
+        await db.prepare(`UPDATE compliance_findings SET status = 'resolved', resolved_at = ? WHERE id = ?`)
+          .bind(nowIso(), row.id).run();
+        resolved++;
+      }
+    }
+  }
+
+  // Score = 100 minus weighted open findings, floored at 0.
+  const openRows = await db.prepare(`SELECT severity, COUNT(*) AS n FROM compliance_findings WHERE tenant_id = ? AND status = 'open' GROUP BY severity`)
+    .bind(tenantId).all<Record<string, unknown>>();
+  let penalty = 0;
+  const bySeverity: Record<string, number> = { critical: 0, high: 0, medium: 0, low: 0 };
+  for (const r of openRows.results || []) {
+    const sev = String(r.severity); const n = Number(r.n);
+    bySeverity[sev] = n;
+    penalty += (SEVERITY_WEIGHT[sev] || 1) * n;
+  }
+  const score = Math.max(0, 100 - penalty);
+
+  await db.prepare(
+    `UPDATE compliance_runs SET completed_at = ?, agents_run = ?, findings_opened = ?, findings_resolved = ?, score = ?, summary = ? WHERE id = ?`,
+  ).bind(nowIso(), roster.length, opened, resolved, score, JSON.stringify({ perAgent, bySeverity }), runId).run();
+
+  return { runId, agentsRun: roster.length, opened, resolved, score, bySeverity, perAgent };
+}
+
+async function complianceOverview(env: Env, request: Request) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const tenantId = String(a.tenant.id);
+  await ensureComplianceRoster(env, tenantId);
+
+  const agents = await env.DB.prepare('SELECT * FROM compliance_agents WHERE tenant_id = ? ORDER BY agent_key').bind(tenantId).all<Record<string, unknown>>();
+  const findings = await env.DB.prepare(
+    `SELECT * FROM compliance_findings WHERE tenant_id = ? AND status != 'resolved'
+     ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, last_seen DESC LIMIT 300`,
+  ).bind(tenantId).all<Record<string, unknown>>();
+  const runs = await env.DB.prepare('SELECT * FROM compliance_runs WHERE tenant_id = ? ORDER BY started_at DESC LIMIT 10').bind(tenantId).all<Record<string, unknown>>();
+
+  const open = (findings.results || []).filter((f) => f.status === 'open');
+  const bySeverity: Record<string, number> = { critical: 0, high: 0, medium: 0, low: 0 };
+  open.forEach((f) => { bySeverity[String(f.severity)] = (bySeverity[String(f.severity)] || 0) + 1; });
+  const penalty = Object.entries(bySeverity).reduce((sum, [sev, n]) => sum + (SEVERITY_WEIGHT[sev] || 1) * n, 0);
+
+  return json({
+    ok: true,
+    chief: {
+      name: 'Chief Compliance Orchestrator',
+      supervises: COMPLIANCE_AGENTS.length,
+      score: Math.max(0, 100 - penalty),
+      lastRun: (runs.results || [])[0]?.started_at || null,
+      cadence: 'daily (cron tick) + on demand',
+    },
+    agents: agents.results || [],
+    findings: findings.results || [],
+    runs: runs.results || [],
+    bySeverity,
+  });
+}
+
+async function complianceRun(env: Env, request: Request, body: Record<string, unknown>) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const res = await runComplianceSweep(env, String(a.tenant.id), 'manual', body.agentKey ? String(body.agentKey) : undefined);
+  await audit(env, { tenantId: String(a.tenant.id), userId: String(a.user.id), action: 'compliance.sweep', resource: 'compliance', details: res, request });
+  return json({ ok: true, ...res });
+}
+
+async function complianceFindingAction(env: Env, request: Request, id: string, body: Record<string, unknown>) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const status = String(body.status || 'resolved');
+  if (!['open', 'resolved', 'waived'].includes(status)) return bad('invalid_status');
+  await env.DB.prepare(
+    `UPDATE compliance_findings SET status = ?, resolved_at = ?, waived_by = ?, waive_reason = ? WHERE id = ? AND tenant_id = ?`,
+  ).bind(status, status === 'open' ? null : nowIso(), status === 'waived' ? String(a.user.id) : null,
+    status === 'waived' ? String(body.reason || '') : null, id, a.tenant.id).run();
+  await audit(env, { tenantId: String(a.tenant.id), userId: String(a.user.id), action: `compliance.finding.${status}`, resource: 'compliance_findings', resourceId: id, request });
+  return json({ ok: true, id, status });
+}
+
+
+/* ══════════════ LIVE STREAM (Server-Sent Events) ══════════════
+ * GET /api/stream?token=<session token>
+ * EventSource cannot set headers, so the session token may ride in the query
+ * string. Emits: hello → snapshot every 5s → audit events as they land.
+ */
+async function liveStream(env: Env, request: Request) {
+  const url = new URL(request.url);
+  const qsToken = url.searchParams.get('token') || '';
+  const bearer = tokenFromRequest(request);
+  const probe = new Request(request.url, { headers: { Authorization: `Bearer ${bearer || qsToken}` } });
+  const a = await auth(env, probe);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+
+  const tenantId = String(a.tenant.id);
+  const db = env.DB;
+  const encoder = new TextEncoder();
+  let cursor = nowIso();
+  let closed = false;
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const send = (event: string, data: unknown) => {
+        if (closed) return;
+        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+      };
+
+      send('hello', { tenant: a.tenant.name, user: a.user.email, at: nowIso() });
+
+      const snapshot = async () => {
+        const one = async (sql: string, ...b: unknown[]) =>
+          Number((await db.prepare(sql).bind(...b).first<Record<string, unknown>>())?.n || 0);
+        return {
+          at: nowIso(),
+          contacts: await one('SELECT COUNT(*) AS n FROM contacts WHERE tenant_id = ?', tenantId),
+          deals: await one('SELECT COUNT(*) AS n FROM deals WHERE tenant_id = ?', tenantId),
+          documents: await one('SELECT COUNT(*) AS n FROM files WHERE tenant_id = ?', tenantId),
+          openTasks: await one(`SELECT COUNT(*) AS n FROM tasks WHERE tenant_id = ? AND status != 'Done'`, tenantId),
+          queuedSends: await one(`SELECT COUNT(*) AS n FROM campaign_recipients WHERE tenant_id = ? AND status = 'queued'`, tenantId),
+          activeWorkflows: await one(`SELECT COUNT(*) AS n FROM workflow_runs WHERE tenant_id = ? AND status IN ('active','waiting')`, tenantId),
+          openFindings: await one(`SELECT COUNT(*) AS n FROM compliance_findings WHERE tenant_id = ? AND status = 'open'`, tenantId),
+          criticalFindings: await one(`SELECT COUNT(*) AS n FROM compliance_findings WHERE tenant_id = ? AND status = 'open' AND severity = 'critical'`, tenantId),
+        };
+      };
+
+      send('snapshot', await snapshot());
+
+      // 5-second heartbeat for ~10 minutes, then the client reconnects.
+      for (let i = 0; i < 120 && !closed; i++) {
+        await new Promise((r) => setTimeout(r, 5000));
+        if (closed) break;
+        try {
+          const events = await db.prepare(
+            `SELECT action, resource, resource_id, created_at FROM audit_logs
+             WHERE tenant_id = ? AND created_at > ? ORDER BY created_at LIMIT 25`,
+          ).bind(tenantId, cursor).all<Record<string, unknown>>();
+          for (const e of events.results || []) {
+            cursor = String(e.created_at);
+            send('activity', e);
+          }
+          send('snapshot', await snapshot());
+        } catch (err) {
+          send('error', { message: String(err).slice(0, 120) });
+          break;
+        }
+      }
+      if (!closed) { send('bye', { at: nowIso() }); controller.close(); }
+    },
+    cancel() { closed = true; },
+  });
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    },
+  });
+}
+
 /* ═══════════════════════════ ROUTER ═══════════════════════════ */
 export const onRequest = async (ctx: Ctx): Promise<Response> => {
   const { request, env, params } = ctx;
@@ -1452,6 +2347,20 @@ export const onRequest = async (ctx: Ctx): Promise<Response> => {
 
     /* ── Bootstrap ── */
     if (route === '/v1/bootstrap' && request.method === 'GET') return handleBootstrap(env, request);
+
+    /* ── Live event stream (SSE) ── */
+    if (route === '/stream' && request.method === 'GET') return liveStream(env, request);
+
+    /* ── Compliance Command Center ── */
+    if (route === '/compliance/overview' && request.method === 'GET') return complianceOverview(env, request);
+    if (route === '/compliance/run' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return complianceRun(env, request, body);
+    }
+    if (/^\/compliance\/findings\/[^/]+$/.test(route) && (request.method === 'PUT' || request.method === 'POST')) {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return complianceFindingAction(env, request, route.split('/')[3], body);
+    }
 
     /* ── Delivery engine ── */
     if (request.method === 'POST' && /^\/campaigns\/[^/]+\/schedule$/.test(route)) {

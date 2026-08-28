@@ -13,6 +13,7 @@ import LoginPage from './pages/auth/LoginPage';
 import SignupPage from './pages/auth/SignupPage';
 import ForgotPasswordPage from './pages/auth/ForgotPasswordPage';
 import ClientPortalPage from './pages/ClientPortalPage';
+import CompliancePage from './pages/CompliancePage';
 
 // Main Pages
 import DashboardPage from './pages/DashboardPage';
@@ -210,6 +211,7 @@ function App() {
           <Route path="/ai/content" element={<ContentGenerator />} />
           
           {/* Enterprise Ecosystem Portal (40 Premium Modules) */}
+          <Route path="/compliance" element={<CompliancePage />} />
           <Route path="/ecosystem" element={<EcosystemPage />} />
           
           {/* Administration & Customizer Settings */}

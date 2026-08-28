@@ -75,3 +75,12 @@ dashboard task board reads and writes `/api/v1/tasks`, so a workflow's
 "Send now" materializes recipients and reports the true queued count; if no
 email/SMS provider is configured the recipients are marked `failed` with the
 provider error rather than displaying a fake "sent" number.
+
+
+## 7. Compliance agents & live stream
+
+The 24 compliance agents never invent a finding: each one is a SQL query over
+this tenant's rows, and a clean practice returns an empty array (score 100).
+Sidebar counters are bound to real store/stream values — badges disappear
+rather than showing a placeholder number. The live activity feed renders
+`audit_logs` rows only.

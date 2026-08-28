@@ -224,6 +224,17 @@ npx wrangler secret put CRON_SECRET        # paste the same value
 Verify: `curl -X POST https://tax-pro-hub-university.pages.dev/api/cron/tick -H "X-Cron-Secret: <secret>"`
 → `{"ok":true,"campaignsSent":0,"workflowsAdvanced":0,...}`
 
+## 3b-2. Compliance sweeps
+
+Once the cron Worker is live (§3b), the tick runs a full 24-agent compliance
+sweep per tenant every 20 hours and records it in `compliance_runs`. Force one
+at any time from `/#/compliance` → **Run full sweep**, or:
+
+```bash
+curl -X POST https://tax-pro-hub-university.pages.dev/api/compliance/run \
+  -H "Authorization: Bearer <session token>"
+```
+
 ## 3c. Client portal
 
 Set `PORTAL_BASE_URL` to the public origin so magic links point at the right host:

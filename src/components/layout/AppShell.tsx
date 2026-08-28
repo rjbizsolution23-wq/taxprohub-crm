@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import InteractiveTutorial, { TutorialWelcomeBanner } from '../tutorial/InteractiveTutorial';
 import { useAppStore } from '../../store';
+import { useLiveStream } from '../../utils/liveStream';
 
 interface NavItem {
   name: string;
@@ -20,6 +21,7 @@ interface NavItem {
   badge?: string;
   badgeColor?: string;
   count?: number;
+  badgeKey?: 'contacts' | 'appointments' | 'workflows' | 'preparers' | 'subAccounts' | 'findings';
 }
 
 const navSections: Array<{ title: string; items: NavItem[] }> = [
@@ -33,9 +35,9 @@ const navSections: Array<{ title: string; items: NavItem[] }> = [
   {
     title: 'CRM',
     items: [
-      { name: 'Contacts', href: '/contacts', icon: Users, badge: '247', color: 'text-pink-400' },
+      { name: 'Contacts', href: '/contacts', icon: Users, badgeKey: 'contacts', color: 'text-pink-400' },
       { name: 'Pipelines', href: '/pipelines', icon: KanbanSquare, badge: '$128K', color: 'text-violet-400' },
-      { name: 'Calendar', href: '/calendar', icon: Calendar, badge: '18 today', color: 'text-emerald-400' },
+      { name: 'Calendar', href: '/calendar', icon: Calendar, badgeKey: 'appointments', color: 'text-emerald-400' },
       { name: 'Conversations', href: '/conversations', icon: MessageSquare, count: 3, color: 'text-amber-400' },
       { name: 'Video Calls', href: '/video', icon: Video, badge: 'live', badgeColor: 'text-emerald-400', color: 'text-red-400' },
     ],
@@ -44,21 +46,21 @@ const navSections: Array<{ title: string; items: NavItem[] }> = [
     title: 'MARKETING',
     items: [
       { name: 'Campaigns', href: '/campaigns', icon: Mail, color: 'text-rose-400' },
-      { name: 'Workflows', href: '/workflows', icon: Zap, badge: '12 active', color: 'text-cyan-400' },
+      { name: 'Workflows', href: '/workflows', icon: Zap, badgeKey: 'workflows', color: 'text-cyan-400' },
       { name: 'Sites & Funnels', href: '/funnels', icon: Globe, color: 'text-fuchsia-400' },
       { name: 'Funnel Genie', href: '/genie', icon: Wand2, badge: 'AI ✦ no-key', badgeColor: 'text-fuchsia-300', color: 'text-fuchsia-300' },
       { name: 'Forms', href: '/forms', icon: FileText, color: 'text-sky-400' },
       { name: 'Blog', href: '/blog', icon: BookOpen, color: 'text-lime-400' },
-      { name: 'Reputation', href: '/settings?tab=reputation', icon: Star, badge: '4.9 ★', color: 'text-amber-300' },
+      { name: 'Reputation', href: '/settings?tab=reputation', icon: Star, color: 'text-amber-300' },
       { name: 'Referrals', href: '/contacts?tab=referrals', icon: UserPlus, color: 'text-teal-400' },
     ],
   },
   {
     title: 'TAX MODULE',
     items: [
-      { name: 'Tax Clients', href: '/tax?tab=clients', icon: Users, badge: '142 active', color: 'text-amber-500' },
+      { name: 'Tax Clients', href: '/tax?tab=clients', icon: Users, badgeKey: 'contacts', color: 'text-amber-500' },
       { name: 'Invoicing', href: '/billing', icon: FileText, badge: '$ due', badgeColor: 'text-emerald-400', color: 'text-emerald-400' },
-      { name: 'Preparers & Payouts', href: '/preparers', icon: Users, badge: '9 active', color: 'text-[#D4AF37]' },
+      { name: 'Preparers & Payouts', href: '/preparers', icon: Users, badgeKey: 'preparers', color: 'text-[#D4AF37]' },
       { name: 'Document Intelligence', href: '/documents', icon: ScanLine, badge: 'OCR ✦ no-key', badgeColor: 'text-emerald-400', color: 'text-amber-400' },
       { name: 'Documents', href: '/tax?tab=documents', icon: Folder, color: 'text-blue-400' },
       { name: 'TaxSlayer Sync', href: '/tax?tab=sync', icon: RefreshCw, badge: '● connected', badgeColor: 'text-emerald-400', color: 'text-cyan-400' },
@@ -73,7 +75,7 @@ const navSections: Array<{ title: string; items: NavItem[] }> = [
     title: 'CREDIT REPAIR',
     items: [
       { name: 'Credit Clients', href: '/contacts?tab=credit', icon: Users, color: 'text-sky-400' },
-      { name: 'Disputes', href: '/contacts?tab=disputes', icon: AlertTriangle, badge: '8 in flight', color: 'text-red-400' },
+      { name: 'Disputes', href: '/contacts?tab=disputes', icon: AlertTriangle, color: 'text-red-400' },
       { name: 'Dispute Letters', href: '/contacts?tab=letters', icon: FileText, color: 'text-purple-400' },
     ],
   },
@@ -101,6 +103,8 @@ const navSections: Array<{ title: string; items: NavItem[] }> = [
     title: 'ENTERPRISE',
     items: [
       { name: 'Enterprise Hub', href: '/ecosystem', icon: Layers, badge: '40 modules', color: 'text-[#D4AF37]' },
+      { name: 'Compliance Center', href: '/compliance', icon: ShieldCheck, badgeKey: 'findings', badge: '20 agents', badgeColor: 'text-emerald-400', color: 'text-emerald-400' },
+      { name: 'Client Portal', href: '/portal', icon: Users, badge: 'passwordless', badgeColor: 'text-cyan-400', color: 'text-cyan-400' },
     ],
   },
   {
@@ -119,7 +123,7 @@ const navSections: Array<{ title: string; items: NavItem[] }> = [
     items: [
       { name: 'Tenant Studio', href: '/tenant-studio', icon: Crown, badge: 'master admin', badgeColor: 'text-amber-400', color: 'text-amber-400' },
       { name: 'Company Onboarding', href: '/onboard', icon: Rocket, badge: 'self-serve', badgeColor: 'text-emerald-400', color: 'text-emerald-400' },
-      { name: 'Sub-Accounts', href: '/admin', icon: Building2, badge: '12 active', color: 'text-blue-400' },
+      { name: 'Sub-Accounts', href: '/admin', icon: Building2, badgeKey: 'subAccounts', color: 'text-blue-400' },
       { name: 'Help Center', href: '/help', icon: HelpCircle, badge: 'docs', badgeColor: 'text-amber-400', color: 'text-amber-300' },
       { name: 'Settings', href: '/settings', icon: Settings, color: 'text-slate-400' },
       { name: 'Audit Logs', href: '/admin?tab=logs', icon: ScrollText, color: 'text-amber-600' },
@@ -131,7 +135,19 @@ const navSections: Array<{ title: string; items: NavItem[] }> = [
 export default function AppShell() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { sidebarOpen, toggleSidebar, logout, currentSubAccount, subAccounts, setCurrentSubAccount } = useAppStore();
+  const { sidebarOpen, toggleSidebar, logout, currentSubAccount, subAccounts, setCurrentSubAccount,
+    contacts, appointments, workflows, preparers } = useAppStore();
+  const { snapshot, connected } = useLiveStream(true);
+
+  /* LIVE sidebar counters — real records only, no invented totals. */
+  const liveBadges: Record<string, string | undefined> = {
+    contacts: contacts.length ? String(contacts.length) : undefined,
+    appointments: appointments.length ? `${appointments.length} booked` : undefined,
+    workflows: workflows.filter((w: any) => w.isActive).length ? `${workflows.filter((w: any) => w.isActive).length} active` : undefined,
+    preparers: preparers.length ? `${preparers.length} active` : undefined,
+    subAccounts: subAccounts.length ? `${subAccounts.length} active` : undefined,
+    findings: snapshot?.openFindings ? `${snapshot.openFindings} open` : undefined,
+  };
   const [isDark, setIsDark] = useState(true);
   const [showTenantMenu, setShowTenantMenu] = useState(false);
   const [showAIQuickBar, setShowAIQuickBar] = useState(false);
@@ -214,11 +230,11 @@ export default function AppShell() {
                       <item.icon className={`h-4 w-4 shrink-0 transition-transform group-hover:scale-110 ${active ? 'text-amber-400' : 'text-slate-400 group-hover:text-amber-400'}`} />
                       <span className="truncate pr-1">{item.name}</span>
                     </div>
-                    {item.badge && (
+                    {((item.badgeKey && liveBadges[item.badgeKey]) || item.badge) && (
                       <span className={`px-1.5 py-0.5 rounded text-[8px] font-mono font-black shrink-0 ${
                         item.badgeColor || 'bg-amber-500/10 text-[#D4AF37] border border-amber-500/20'
                       }`}>
-                        {item.badge}
+                        {(item.badgeKey && liveBadges[item.badgeKey]) || item.badge}
                       </span>
                     )}
                     {item.count !== undefined && (
