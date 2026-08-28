@@ -1,0 +1,20 @@
+# 🗺️ ROBOTS INDEXING DIRECTIVE — RJ BUSINESS SOLUTIONS
+User-agent: *
+
+# Publicly Indexable Marketing Funnels
+Allow: /
+Allow: /login
+Allow: /signup
+Allow: /forgot-password
+
+# Secure Administrative Dashboards & Vaults (Disallowed to guard client privacy)
+Disallow: /dashboard
+Disallow: /contacts
+Disallow: /pipelines
+Disallow: /calendar
+Disallow: /conversations
+Disallow: /analytics
+Disallow: /settings
+
+# Sitemap Location
+Sitemap: https://rjbusinesssolutions.org/sitemap.xml

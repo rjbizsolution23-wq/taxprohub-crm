@@ -1,0 +1,34 @@
+# ═══════════════════════════════════════════════════════════════
+# CLOUDFLARE PAGES — RJ Business Solutions TAX PRO HUB UNIVERSITY
+# ═══════════════════════════════════════════════════════════════
+# Deploy:
+#   npm run build
+#   npx wrangler pages deploy dist --project-name tax-pro-hub-university
+#
+# The functions/ directory ships automatically with Pages —
+# every /api/* route runs as a Cloudflare Worker at the edge.
+#
+# Secrets (set once per environment):
+#   npx wrangler pages secret put TWILIO_ACCOUNT_SID
+#   npx wrangler pages secret put TWILIO_AUTH_TOKEN
+#   npx wrangler pages secret put TWILIO_FROM_NUMBER
+#   npx wrangler pages secret put STRIPE_SECRET_KEY
+#   npx wrangler pages secret put STRIPE_WEBHOOK_SECRET
+#   npx wrangler pages secret put CF_CALLS_APP_ID        # Cloudflare Calls (video)
+#   npx wrangler pages secret put CF_CALLS_APP_SECRET
+#   npx wrangler pages secret put OPENAI_API_KEY         # any OpenAI-compatible provider
+#   npx wrangler pages secret put OPENAI_BASE_URL
+#   npx wrangler pages secret put RESEND_API_KEY         # optional; MailChannels fallback is free
+#   npx wrangler pages secret put MAIL_FROM
+#
+# Durable ledger (payouts, referrals, stripe events):
+#   npx wrangler kv namespace create LEDGER
+#   → paste the returned id below and uncomment the binding.
+
+name = "tax-pro-hub-university"
+compatibility_date = "2026-08-01"
+pages_build_output_dir = "dist"
+
+[[kv_namespaces]]
+binding = "LEDGER"
+id = "efc2da2c19934e68a956a84bfe76f7a2"

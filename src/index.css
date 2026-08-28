@@ -1,0 +1,160 @@
+@import "tailwindcss";
+
+:root {
+  --color-primary: #D4AF37;
+  --color-secondary: #111111;
+  --color-accent: #FFD700;
+  --color-success: #10b981;
+  --color-warning: #fbbf24;
+  --color-danger: #ef4444;
+  --color-info: #3b82f6;
+}
+
+body {
+  font-family: 'Inter', system_ui, sans-serif;
+  transition: background-color 200ms ease, color 200ms ease;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+.dark {
+  --background: #030712;
+  --surface: #111827;
+  --surface-2: #1f2937;
+  --border: #334155;
+  --text: #f1f5f9;
+  --text-muted: #94a3b8;
+  --primary: #D4AF37;
+  --secondary: #111111;
+}
+
+/* Comprehensive Dark Mode Utility Adaptations */
+.dark .bg-white,
+.dark .bg-slate-50,
+.dark .bg-gray-50,
+.dark .bg-zinc-50,
+.dark .bg-neutral-50 {
+  background-color: #030712 !important; /* Deepest Obsidian Black */
+}
+
+.dark .bg-slate-100,
+.dark .bg-gray-100,
+.dark .bg-zinc-100,
+.dark .bg-neutral-100 {
+  background-color: #090d16 !important; /* Dark Gray-Obsidian */
+}
+
+.dark .bg-slate-200,
+.dark .bg-gray-200,
+.dark .bg-zinc-200,
+.dark .bg-neutral-200 {
+  background-color: #111625 !important; /* Secondary Obsidian */
+}
+
+.dark .hover\:bg-gray-50:hover,
+.dark .hover\:bg-slate-50:hover {
+  background-color: #090d16 !important;
+}
+
+.dark .hover\:bg-gray-100:hover,
+.dark .hover\:bg-slate-100:hover {
+  background-color: #111625 !important;
+}
+
+/* High-Contrast Gold Alloy Outlines */
+.dark .border-gray-100,
+.dark .border-slate-100,
+.dark .border-gray-200,
+.dark .border-slate-200,
+.dark .border-gray-300,
+.dark .border-slate-300 {
+  border-color: rgba(212, 175, 55, 0.12) !important; /* Micro-glowing gold borders */
+}
+
+/* Adaptive High-Contrast Typography */
+.dark .text-gray-900,
+.dark .text-slate-900,
+.dark .text-zinc-900,
+.dark .text-neutral-900 {
+  color: #ffffff !important;
+}
+
+.dark .text-gray-800,
+.dark .text-slate-800,
+.dark .text-zinc-800,
+.dark .text-neutral-800 {
+  color: #f1f5f9 !important;
+}
+
+.dark .text-gray-700,
+.dark .text-slate-700,
+.dark .text-zinc-700,
+.dark .text-neutral-700 {
+  color: #cbd5e1 !important;
+}
+
+.dark .text-gray-600,
+.dark .text-slate-600,
+.dark .text-zinc-600,
+.dark .text-neutral-600 {
+  color: #94a3b8 !important;
+}
+
+.dark .text-gray-500,
+.dark .text-slate-500,
+.dark .text-zinc-500,
+.dark .text-neutral-500 {
+  color: #64748b !important;
+}
+
+/* Standardized Premium Input Backdrop */
+.dark input,
+.dark textarea,
+.dark select {
+  background-color: #090d16 !important;
+  color: #f1f5f9 !important;
+  border-color: rgba(212, 175, 55, 0.15) !important;
+}
+
+.dark input::placeholder,
+.dark textarea::placeholder {
+  color: #475569 !important;
+}
+
+.glass {
+  background: rgba(17, 24, 39, 0.85);
+  backdrop-filter: blur(20px);
+  border: 1px solid rgba(51, 65, 85, 0.6);
+}
+
+.card-hover {
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.card-hover:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0f172a;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 20px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+
+

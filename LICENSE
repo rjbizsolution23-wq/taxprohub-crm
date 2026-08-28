@@ -1,0 +1,83 @@
+PROPRIETARY COMMERCIAL SOFTWARE LICENSE AGREEMENT
+=================================================
+
+PRODUCT NAME: RJ Business Solutions Virtual Tax Pro (Vesion 4.0.0)
+LICENSOR: RJ Business Solutions
+OWNER: Rick Jefferson
+HQ ADDRESS: 1342 NM 333, Tijeras, New Mexico 87059, United States
+EMAIL: support@rjbusinesssolutions.org | rjbizsolution23@gmail.com
+PHONE: +1 (414) 430-4277
+WEBSITE: https://rickjeffersonsolutions.com | https://rjbusinesssolutions.org
+
+DATE OF AGREEMENT: May 26, 2026
+BUILD ID: NEL-20260526-948217
+
+--------------------------------------------------------------------------------
+THIS LICENSE AGREEMENT ("Agreement") is a legal contract between you ("Licensee")
+and RJ Business Solutions ("Licensor" or "RJ Business Solutions") for the 
+software product identified above, which includes computer code, layouts, visual
+designs, simulated modules, assets, and accompanying documentation ("Software").
+
+BY INSTALLING, COPYING, OR OTHERWISE USING THE SOFTWARE, YOU AGREE TO BE BOUND 
+BY THE TERMS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT INSTALL, USE, OR 
+COPY THE SOFTWARE.
+
+1. PROPRIETARY AND CONFIDENTIALITY RIGHTS
+-----------------------------------------
+All title, copyrights, trademarks, patent rights, trade secrets, and other 
+intellectual property rights in and to the Software (including but not limited 
+to any source code, obfuscated code, compiled bundles, active browser security 
+shields, 36-tab Sidebar layouts, IRS cognitive assistant prompts, custom CSS 
+classes, icons, graphics, images, and text incorporated into the Software) 
+are owned exclusively by RJ Business Solutions and Rick Jefferson.
+
+The Software is protected by United States copyright laws and international 
+treaty provisions. The Software is licensed, not sold. Licensee must treat 
+the Software like any other highly confidential and proprietary material.
+
+2. STRICT PROHIBITION ON COPYING, CLONING, AND REVERSE ENGINEERING
+------------------------------------------------------------------
+Licensee is explicitly PROHIBITED from:
+  a. Copying, cloning, duplicating, or distributing any portion of the 
+     Software's front-end or back-end source code.
+  b. Sharing, selling, renting, leasing, sub-licensing, or transferring the 
+     Software or any rights under this Agreement to third parties.
+  c. Reverse-engineering, decompiling, disassembling, de-obfuscating, or 
+     attempting to reconstruct the logic or proprietary algorithms of the 
+     Software.
+  d. Creating derivative works based on the unique design layout, visual CSS 
+     tokens, Obsidian Black (#030712) and Gold Foil (#D4AF37) custom palettes, 
+     or user workflows of the Software.
+  e. Using automated scrapers, web-crawlers, indexing bots, or code extraction
+     agents to inspect, scan, parse, or steal the frontend/client code.
+
+3. REPOSITORY PRIVACY MANDATE
+-----------------------------
+This software repository and all associated backup, staging, or deployment 
+remotes must remain STRICTLY PRIVATE. Licensee must never set the repository 
+visibility to "Public" on GitHub, GitLab, Bitbucket, or any other hosting 
+provider, and must disable all public forks, issues, and discussions.
+
+4. WARRANTY AND DISCLAIMER
+--------------------------
+THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESS 
+OR IMPLIED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF 
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, OR NON-INFRINGEMENT.
+
+IN NO EVENT SHALL THE LICENSOR OR RICK JEFFERSON BE LIABLE FOR ANY DAMAGES 
+WHATSOEVER (INCLUDING, WITHOUT LIMITATION, DAMAGES FOR LOSS OF BUSINESS PROFITS, 
+BUSINESS INTERRUPTION, LOSS OF BUSINESS INFORMATION, OR OTHER PECUNIARY LOSS) 
+ARISING OUT OF THE USE OF OR INABILITY TO USE THIS SOFTWARE, EVEN IF LICENSOR 
+HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+5. GOVERNING LAW
+----------------
+This Agreement is governed by and construed in accordance with the laws of 
+the State of New Mexico, USA, without regard to its conflict of law principles. 
+Any legal action or proceeding arising under this Agreement will be brought 
+exclusively in the federal or state courts located in Bernalillo County, New Mexico.
+
+--------------------------------------------------------------------------------
+RJ Business Solutions © 2026. All Rights Reserved.
+Protected by U.S. Patent, Copyright, and Trade Secret Laws.
+***
