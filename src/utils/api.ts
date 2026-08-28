@@ -93,8 +93,11 @@ export const apiSignup = (payload: {
   fullName: string; businessName: string; email: string; password: string; phone?: string;
 }) => apiFetch<AuthPayload>('/api/auth/signup', { method: 'POST', body: JSON.stringify(payload) });
 
-export const apiLogin = (email: string, password: string) =>
-  apiFetch<AuthPayload>('/api/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) });
+export const apiLogin = (email: string, password: string, code?: string) =>
+  apiFetch<AuthPayload>('/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify(code ? { email, password, code } : { email, password }),
+  });
 
 export const apiMe = () => apiFetch<{ user: unknown; tenant: unknown }>('/api/auth/me');
 

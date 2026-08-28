@@ -13,6 +13,8 @@ export default function LoginPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
+  const [mfaCode, setMfaCode] = useState('');
+  const [mfaRequired, setMfaRequired] = useState(false);
 
   // Channel Authentication on-the-fly states
   const [selectedChannel, setSelectedChannel] = useState<any | null>(null);
@@ -28,7 +30,7 @@ export default function LoginPage() {
     setError('');
 
     // ── 1) Real Cloudflare/D1 backend first ──
-    const backendRes = await apiLogin(email, password);
+    const backendRes = await apiLogin(email, password, mfaRequired ? mfaCode : undefined);
     if (backendRes.ok && backendRes.data?.token) {
       setToken(backendRes.data.token);
       const boot = await apiBootstrap();
@@ -40,6 +42,17 @@ export default function LoginPage() {
         return;
       }
       setError('Backend session created but data sync failed. Using demo mode.');
+    } else if (backendRes.error === 'mfa_required') {
+      // Account has TOTP enabled — ask for the 6-digit code and re-submit.
+      setMfaRequired(true);
+      setError('Enter the 6-digit code from your authenticator app.');
+      setIsLoading(false);
+      return;
+    } else if (backendRes.error === 'invalid_mfa_code') {
+      setMfaRequired(true);
+      setError('That code was rejected. Wait for the next code and try again.');
+      setIsLoading(false);
+      return;
     } else if (backendRes.status === 401 || (backendRes.status >= 400 && backendRes.status < 500)) {
       setError(backendRes.error === 'unauthenticated' ? 'Invalid email or password.' : (backendRes.error || 'Sign-in failed.'));
       setIsLoading(false);
@@ -157,6 +170,25 @@ export default function LoginPage() {
             </button>
           </div>
         </div>
+
+        {mfaRequired && (
+          <div className="mb-5">
+            <label htmlFor="mfaCode" className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-2">
+              Authenticator code
+            </label>
+            <input
+              id="mfaCode"
+              inputMode="numeric"
+              maxLength={6}
+              value={mfaCode}
+              onChange={(e) => setMfaCode(e.target.value.replace(/\D/g, ''))}
+              placeholder="123456"
+              autoFocus
+              className="w-full rounded-xl border border-amber-500/30 bg-neutral-950 px-4 py-3 text-lg font-mono tracking-[0.4em] text-white outline-none focus:border-[#D4AF37]"
+            />
+            <p className="text-[10px] text-slate-500 mt-1.5">Lost your device? Enter one of your one-time recovery codes.</p>
+          </div>
+        )}
 
         <div className="flex items-center justify-between pt-1">
           <label className="flex items-center cursor-pointer select-none">

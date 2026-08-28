@@ -138,6 +138,34 @@ Functions) against **D1** with per-tenant isolation:
 Full audit & architecture: [`ANALYSIS.md`](./ANALYSIS.md) ·
 Deployment: [`docs/DEPLOYMENT_RUNBOOK.md`](./docs/DEPLOYMENT_RUNBOOK.md)
 
+## 🔐 MFA (TOTP) + PLAN ENFORCEMENT + PLATFORM ADMIN
+
+**Two-factor authentication** — RFC 6238 TOTP implemented at the edge (HMAC-SHA1
+via WebCrypto, ±1 step window, time-step replay protection, 8 one-time recovery
+codes hashed at rest). Enrol at `/#/security`; login returns `mfa_required`
+until a valid code is supplied. Required by FTC Safeguards §314.4(c)(5).
+
+**Plan entitlements** — every tier is enforced server-side, not just displayed:
+
+| | Starter $199 | Professional $399 | Enterprise $899 |
+|---|---|---|---|
+| Seats | 2 | 8 | 40 |
+| Clients | 500 | 5,000 | 100,000 |
+| Emails / month | 2,000 | 25,000 | 250,000 |
+| SMS / month | 500 | 5,000 | 50,000 |
+| Vault documents | 2,000 | 25,000 | 250,000 |
+| Sub-accounts | 1 | 3 | 50 |
+
+Exceeding a ceiling returns **HTTP 402 `plan_limit_reached`** with the metric,
+limit, current usage and the tier to upgrade to. Metered usage (emails, SMS,
+signatures) only increments on *successful* delivery, in `usage_counters` keyed
+by `YYYY-MM`.
+
+**Platform admin** — `GET /api/platform/overview` gives RJ Business Solutions
+staff every tenant with live usage, open compliance findings and total MRR, plus
+`POST /api/platform/plan` to move a tenant between tiers. The first user created
+on the platform is bootstrapped as the owner; everyone else gets `403`.
+
 ## ✍️ E-SIGNATURE ENGINE (ESIGN Act / UETA)
 
 Send engagement letters, **Form 8879**, §7216 consents and CROA disclosures for

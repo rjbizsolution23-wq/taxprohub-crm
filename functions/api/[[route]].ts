@@ -447,6 +447,27 @@ async function handleLogin(env: Env, request: Request, body: Record<string, unkn
   const ok = await verifyPassword(password, String(user.password_hash), env.SESSION_SECRET);
   if (!ok) return bad('Invalid email or password.', 401);
 
+  // Second factor, when the account has TOTP enabled.
+  const mfa = await env.DB.prepare('SELECT * FROM user_mfa WHERE user_id = ? AND enabled = 1')
+    .bind(user.id).first<Record<string, any>>().catch(() => null);
+  if (mfa) {
+    const code = String(body.code || body.mfaCode || '').trim();
+    if (!code) return json({ ok: false, error: 'mfa_required', hint: 'Enter the 6-digit code from your authenticator app.' }, 401);
+    let passed = await verifyTotp(env, String(user.id), String(mfa.secret), code, Number(mfa.last_used_step || 0));
+    if (!passed) {
+      // Fall back to a one-time backup code.
+      const hashes = safeJson<string[]>(mfa.backup_codes, []);
+      const supplied = await sha256(code.toUpperCase());
+      if (hashes.includes(supplied)) {
+        passed = true;
+        await env.DB.prepare('UPDATE user_mfa SET backup_codes = ?, updated_at = ? WHERE user_id = ?')
+          .bind(JSON.stringify(hashes.filter((h) => h !== supplied)), nowIso(), user.id).run();
+        await audit(env, { tenantId: String(user.tenant_id), userId: String(user.id), action: 'mfa.backup_code_used', resource: 'users', resourceId: String(user.id), request });
+      }
+    }
+    if (!passed) return json({ ok: false, error: 'invalid_mfa_code' }, 401);
+  }
+
   const session = await createSession(env, String(user.id), String(user.tenant_id), request);
   const tenant = await env.DB.prepare('SELECT * FROM tenants WHERE id = ?').bind(user.tenant_id).first<Record<string, unknown>>();
 
@@ -791,6 +812,8 @@ function health(env: Env) {
       cron_engine: !!env.CRON_SECRET,
       compliance_agents: COMPLIANCE_AGENTS.length,
       esign_engine: true,
+      mfa_totp: true,
+      plan_enforcement: true,
       invoicing: !!env.STRIPE_SECRET_KEY,
       twilio_sms: !!(env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && env.TWILIO_FROM_NUMBER),
       stripe: !!env.STRIPE_SECRET_KEY,
@@ -1035,6 +1058,12 @@ async function scheduleCampaign(env: Env, request: Request, campaignId: string, 
   }
   if (!rows.length) return json({ ok: false, error: 'no_reachable_recipients' }, 400);
 
+  // Monthly send ceiling for the tenant's plan.
+  const emailCount = rows.filter((r) => r.channel === 'email').length;
+  const smsCount = rows.length - emailCount;
+  if (emailCount) { const blocked = await enforceLimit(env, a.tenant, 'emailsPerMonth', emailCount); if (blocked) return blocked; }
+  if (smsCount) { const blocked = await enforceLimit(env, a.tenant, 'smsPerMonth', smsCount); if (blocked) return blocked; }
+
   await env.DB.prepare(
     `INSERT INTO campaign_runs (id, tenant_id, campaign_id, status, scheduled_at, total, sent, failed, created_by, created_at)
      VALUES (?, ?, ?, 'scheduled', ?, ?, 0, 0, ?, ?)`,
@@ -1219,7 +1248,10 @@ async function cronTick(env: Env, request: Request) {
     await env.DB.prepare(
       `UPDATE campaign_runs SET status = 'sending', started_at = COALESCE(started_at, ?), sent = sent + ?, failed = failed + ? WHERE id = ?`,
     ).bind(now, ok ? 1 : 0, ok ? 0 : 1, r.run_id).run();
-    if (ok) result.campaignsSent++; else result.campaignsFailed++;
+    if (ok) {
+      result.campaignsSent++;
+      await bumpUsage(env, String(r.tenant_id), r.channel === 'email' ? 'emails' : 'sms', 1);
+    } else result.campaignsFailed++;
   }
 
   // Close finished runs and roll counters onto the campaign record.
@@ -2563,6 +2595,7 @@ async function createSignatureRequest(env: Env, request: Request, body: Record<s
     text: `Hello ${contact.first_name || ''},\n\n${tenantRow.business_name || tenantRow.name || 'Your tax team'} has sent "${title}" for your electronic signature.\n\nOpen and sign here (expires in ${SIGN_TTL_DAYS} days):\n${link}\n\n${ESIGN_DISCLOSURE}`,
   });
 
+  await bumpUsage(env, String(a.tenant.id), 'signatures', 1);
   await audit(env, { tenantId: String(a.tenant.id), userId: String(a.user.id), action: 'esign.request', resource: 'signature_requests', resourceId: id, details: { docType, email, delivered: mail.ok }, request });
   return json({ ok: true, id, title, signerEmail: email, expiresAt: expires, delivered: mail.ok, link }, 201);
 }
@@ -2783,6 +2816,274 @@ async function markInvoicePaid(env: Env, tenantId: string, invoiceId: string, pa
   }
 }
 
+
+/* ═══════════════ PLANS, METERING & PLATFORM ADMIN ═══════════════ */
+
+interface PlanDef {
+  key: string; label: string; priceMonthly: number;
+  seats: number; contacts: number; emailsPerMonth: number; smsPerMonth: number;
+  storageDocs: number; subAccounts: number; features: string[];
+}
+
+const PLANS: Record<string, PlanDef> = {
+  starter: {
+    key: 'starter', label: 'Starter', priceMonthly: 199,
+    seats: 2, contacts: 500, emailsPerMonth: 2_000, smsPerMonth: 500,
+    storageDocs: 2_000, subAccounts: 1,
+    features: ['CRM + pipelines', 'Document vault', 'Client portal', 'Compliance agents', 'E-signature'],
+  },
+  professional: {
+    key: 'professional', label: 'Professional', priceMonthly: 399,
+    seats: 8, contacts: 5_000, emailsPerMonth: 25_000, smsPerMonth: 5_000,
+    storageDocs: 25_000, subAccounts: 3,
+    features: ['Everything in Starter', 'Campaign engine', 'Workflow automation', 'Stripe invoicing', 'Preparer payouts'],
+  },
+  enterprise: {
+    key: 'enterprise', label: 'Enterprise', priceMonthly: 899,
+    seats: 40, contacts: 100_000, emailsPerMonth: 250_000, smsPerMonth: 50_000,
+    storageDocs: 250_000, subAccounts: 50,
+    features: ['Everything in Professional', 'White-label sub-accounts', 'API keys + webhooks', 'Priority compliance review', 'Dedicated onboarding'],
+  },
+};
+
+const planFor = (tenant: any): PlanDef => PLANS[String(tenant?.plan || 'starter').toLowerCase()] || PLANS.starter;
+const currentPeriod = () => new Date().toISOString().slice(0, 7);
+
+async function bumpUsage(env: Env, tenantId: string, metric: string, by = 1) {
+  if (!env.DB || by <= 0) return;
+  const period = currentPeriod();
+  await env.DB.prepare(
+    `INSERT INTO usage_counters (id, tenant_id, period, metric, count, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(tenant_id, period, metric) DO UPDATE SET count = count + excluded.count, updated_at = excluded.updated_at`,
+  ).bind(uuid(), tenantId, period, metric, by, nowIso()).run();
+}
+
+async function getUsage(env: Env, tenantId: string) {
+  const one = async (sql: string, ...b: unknown[]) =>
+    Number((await env.DB!.prepare(sql).bind(...b).first<Record<string, unknown>>())?.n || 0);
+  const metered = await env.DB!.prepare('SELECT metric, count FROM usage_counters WHERE tenant_id = ? AND period = ?')
+    .bind(tenantId, currentPeriod()).all<Record<string, unknown>>();
+  const m: Record<string, number> = {};
+  (metered.results || []).forEach((r) => { m[String(r.metric)] = Number(r.count); });
+  return {
+    seats: await one('SELECT COUNT(*) AS n FROM users WHERE tenant_id = ?', tenantId),
+    contacts: await one('SELECT COUNT(*) AS n FROM contacts WHERE tenant_id = ?', tenantId),
+    storageDocs: await one('SELECT COUNT(*) AS n FROM files WHERE tenant_id = ?', tenantId),
+    subAccounts: 1,
+    emailsPerMonth: m.emails || 0,
+    smsPerMonth: m.sms || 0,
+    signatures: m.signatures || 0,
+  };
+}
+
+/** Returns a 402 response when the action would exceed the tenant's plan. */
+async function enforceLimit(env: Env, tenant: any, metric: keyof PlanDef, add = 1): Promise<Response | null> {
+  if (!env.DB) return null;
+  const plan = planFor(tenant);
+  const cap = Number(plan[metric] || 0);
+  if (!cap) return null;
+  const usage = await getUsage(env, String(tenant.id));
+  const used = Number((usage as any)[metric] || 0);
+  if (used + add <= cap) return null;
+  return json({
+    ok: false, error: 'plan_limit_reached', metric, plan: plan.key, limit: cap, used,
+    hint: `${plan.label} includes ${cap.toLocaleString()} ${String(metric)}. Upgrade to continue.`,
+    upgradeTo: plan.key === 'starter' ? 'professional' : 'enterprise',
+  }, 402);
+}
+
+async function planStatus(env: Env, request: Request) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const tenantRow = await env.DB.prepare('SELECT * FROM tenants WHERE id = ?').bind(a.tenant.id).first<Record<string, any>>();
+  const plan = planFor(tenantRow);
+  const usage = await getUsage(env, String(a.tenant.id));
+  const pct = (used: number, cap: number) => (cap ? Math.min(100, Math.round((used / cap) * 100)) : 0);
+  return json({
+    ok: true,
+    plan,
+    catalog: Object.values(PLANS),
+    period: currentPeriod(),
+    usage,
+    utilization: {
+      seats: pct(usage.seats, plan.seats),
+      contacts: pct(usage.contacts, plan.contacts),
+      emailsPerMonth: pct(usage.emailsPerMonth, plan.emailsPerMonth),
+      smsPerMonth: pct(usage.smsPerMonth, plan.smsPerMonth),
+      storageDocs: pct(usage.storageDocs, plan.storageDocs),
+    },
+  });
+}
+
+async function isPlatformAdmin(env: Env, userId: string) {
+  if (!env.DB) return false;
+  const row = await env.DB.prepare('SELECT user_id FROM platform_admins WHERE user_id = ?').bind(userId).first();
+  if (row) return true;
+  // Bootstrap: the very first user of the very first tenant owns the platform.
+  const count = await env.DB.prepare('SELECT COUNT(*) AS n FROM platform_admins').first<Record<string, unknown>>();
+  if (Number(count?.n || 0) > 0) return false;
+  const first = await env.DB.prepare('SELECT id, email FROM users ORDER BY created_at LIMIT 1').first<Record<string, unknown>>();
+  if (first && String(first.id) === userId) {
+    await env.DB.prepare('INSERT OR IGNORE INTO platform_admins (user_id, email, granted_by, created_at) VALUES (?, ?, ?, ?)')
+      .bind(userId, String(first.email), 'bootstrap', nowIso()).run();
+    return true;
+  }
+  return false;
+}
+
+/** Cross-tenant operator view — platform admins only. */
+async function platformOverview(env: Env, request: Request) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  if (!(await isPlatformAdmin(env, String(a.user.id)))) return json({ ok: false, error: 'forbidden_platform_admin_only' }, 403);
+
+  const tenants = await env.DB.prepare('SELECT id, name, business_name, plan, status, created_at FROM tenants ORDER BY created_at DESC').all<Record<string, any>>();
+  const rows: Record<string, unknown>[] = [];
+  let mrr = 0;
+  for (const t of tenants.results || []) {
+    const usage = await getUsage(env, String(t.id));
+    const plan = planFor(t);
+    mrr += plan.priceMonthly;
+    const findings = await env.DB.prepare(`SELECT COUNT(*) AS n FROM compliance_findings WHERE tenant_id = ? AND status = 'open'`)
+      .bind(t.id).first<Record<string, unknown>>();
+    rows.push({ ...t, planLabel: plan.label, priceMonthly: plan.priceMonthly, usage, openFindings: Number(findings?.n || 0) });
+  }
+  return json({ ok: true, tenants: rows, totals: { tenants: rows.length, mrr }, plans: Object.values(PLANS) });
+}
+
+async function setTenantPlan(env: Env, request: Request, body: Record<string, unknown>) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  if (!(await isPlatformAdmin(env, String(a.user.id)))) return json({ ok: false, error: 'forbidden_platform_admin_only' }, 403);
+  const planKey = String(body.plan || '').toLowerCase();
+  if (!PLANS[planKey]) return bad('unknown_plan');
+  const tenantId = String(body.tenantId || a.tenant.id);
+  await env.DB.prepare('UPDATE tenants SET plan = ?, updated_at = ? WHERE id = ?').bind(planKey, nowIso(), tenantId).run();
+  await audit(env, { tenantId, userId: String(a.user.id), action: 'platform.plan_change', resource: 'tenants', resourceId: tenantId, details: { plan: planKey }, request });
+  return json({ ok: true, tenantId, plan: PLANS[planKey] });
+}
+
+/* ═══════════════════ MFA — TOTP (RFC 6238) ═══════════════════ */
+
+const B32_ALPHA = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+function base32Encode(bytes: Uint8Array) {
+  let bits = 0, value = 0, out = '';
+  for (const b of bytes) {
+    value = (value << 8) | b; bits += 8;
+    while (bits >= 5) { out += B32_ALPHA[(value >>> (bits - 5)) & 31]; bits -= 5; }
+  }
+  if (bits > 0) out += B32_ALPHA[(value << (5 - bits)) & 31];
+  return out;
+}
+
+function base32Decode(input: string) {
+  const clean = input.toUpperCase().replace(/[^A-Z2-7]/g, '');
+  let bits = 0, value = 0;
+  const out: number[] = [];
+  for (const ch of clean) {
+    value = (value << 5) | B32_ALPHA.indexOf(ch); bits += 5;
+    if (bits >= 8) { out.push((value >>> (bits - 8)) & 0xff); bits -= 8; }
+  }
+  return new Uint8Array(out);
+}
+
+async function totpCode(secretB32: string, step: number) {
+  const key = await crypto.subtle.importKey('raw', base32Decode(secretB32), { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
+  const counter = new ArrayBuffer(8);
+  const view = new DataView(counter);
+  view.setUint32(0, Math.floor(step / 0x100000000));
+  view.setUint32(4, step >>> 0);
+  const mac = new Uint8Array(await crypto.subtle.sign('HMAC', key, counter));
+  const offset = mac[mac.length - 1] & 0x0f;
+  const bin = ((mac[offset] & 0x7f) << 24) | (mac[offset + 1] << 16) | (mac[offset + 2] << 8) | mac[offset + 3];
+  return String(bin % 1_000_000).padStart(6, '0');
+}
+
+/** Verifies a TOTP within ±1 step (±30s) and blocks step replay. */
+async function verifyTotp(env: Env, userId: string, secret: string, code: string, lastStep: number) {
+  const clean = code.replace(/\D/g, '');
+  if (clean.length !== 6) return false;
+  const now = Math.floor(Date.now() / 30_000);
+  for (const step of [now, now - 1, now + 1]) {
+    if (step <= lastStep) continue;
+    if (await totpCode(secret, step) === clean) {
+      if (env.DB) await env.DB.prepare('UPDATE user_mfa SET last_used_step = ?, updated_at = ? WHERE user_id = ?')
+        .bind(step, nowIso(), userId).run();
+      return true;
+    }
+  }
+  return false;
+}
+
+async function mfaStatus(env: Env, request: Request) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const row = await env.DB.prepare('SELECT enabled, confirmed_at, backup_codes FROM user_mfa WHERE user_id = ?')
+    .bind(a.user.id).first<Record<string, unknown>>();
+  return json({
+    ok: true,
+    enabled: Number(row?.enabled || 0) === 1,
+    confirmedAt: row?.confirmed_at || null,
+    backupCodesRemaining: safeJson<string[]>(row?.backup_codes, []).length,
+  });
+}
+
+async function mfaSetup(env: Env, request: Request) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const secret = base32Encode(crypto.getRandomValues(new Uint8Array(20)));
+  const now = nowIso();
+  await env.DB.prepare(
+    `INSERT INTO user_mfa (user_id, tenant_id, secret, enabled, backup_codes, created_at, updated_at)
+     VALUES (?, ?, ?, 0, '[]', ?, ?)
+     ON CONFLICT(user_id) DO UPDATE SET secret = excluded.secret, enabled = 0, backup_codes = '[]', last_used_step = 0, updated_at = excluded.updated_at`,
+  ).bind(a.user.id, a.tenant.id, secret, now, now).run();
+
+  const label = encodeURIComponent(`Tax Pro Hub:${a.user.email}`);
+  const issuer = encodeURIComponent(String(a.tenant.businessName || a.tenant.name || 'Tax Pro Hub University'));
+  return json({
+    ok: true,
+    secret,
+    otpauthUrl: `otpauth://totp/${label}?secret=${secret}&issuer=${issuer}&algorithm=SHA1&digits=6&period=30`,
+    instructions: 'Add the secret to Google Authenticator, 1Password or Authy, then confirm with a 6-digit code.',
+  });
+}
+
+async function mfaConfirm(env: Env, request: Request, body: Record<string, unknown>) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const row = await env.DB.prepare('SELECT * FROM user_mfa WHERE user_id = ?').bind(a.user.id).first<Record<string, any>>();
+  if (!row) return bad('run_mfa_setup_first');
+  const ok = await verifyTotp(env, String(a.user.id), String(row.secret), String(body.code || ''), Number(row.last_used_step || 0));
+  if (!ok) return json({ ok: false, error: 'invalid_code' }, 401);
+
+  const codes = Array.from({ length: 8 }, () => randHex(4).toUpperCase());
+  const hashes = await Promise.all(codes.map((c) => sha256(c)));
+  await env.DB.prepare('UPDATE user_mfa SET enabled = 1, confirmed_at = ?, backup_codes = ?, updated_at = ? WHERE user_id = ?')
+    .bind(nowIso(), JSON.stringify(hashes), nowIso(), a.user.id).run();
+  await audit(env, { tenantId: String(a.tenant.id), userId: String(a.user.id), action: 'mfa.enabled', resource: 'users', resourceId: String(a.user.id), request });
+  return json({ ok: true, enabled: true, backupCodes: codes, note: 'Store these one-time recovery codes now — they are not shown again.' });
+}
+
+async function mfaDisable(env: Env, request: Request, body: Record<string, unknown>) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const user = await env.DB.prepare('SELECT password_hash FROM users WHERE id = ?').bind(a.user.id).first<Record<string, unknown>>();
+  const ok = await verifyPassword(String(body.password || ''), String(user?.password_hash || ''), env.SESSION_SECRET);
+  if (!ok) return json({ ok: false, error: 'password_required' }, 401);
+  await env.DB.prepare('DELETE FROM user_mfa WHERE user_id = ?').bind(a.user.id).run();
+  await audit(env, { tenantId: String(a.tenant.id), userId: String(a.user.id), action: 'mfa.disabled', resource: 'users', resourceId: String(a.user.id), request });
+  return json({ ok: true, enabled: false });
+}
+
 /* ═══════════════════════════ ROUTER ═══════════════════════════ */
 export const onRequest = async (ctx: Ctx): Promise<Response> => {
   const { request, env, params } = ctx;
@@ -2811,6 +3112,26 @@ export const onRequest = async (ctx: Ctx): Promise<Response> => {
 
     /* ── Bootstrap ── */
     if (route === '/v1/bootstrap' && request.method === 'GET') return handleBootstrap(env, request);
+
+    /* ── Plans, metering, platform admin ── */
+    if (route === '/plan' && request.method === 'GET') return planStatus(env, request);
+    if (route === '/platform/overview' && request.method === 'GET') return platformOverview(env, request);
+    if (route === '/platform/plan' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return setTenantPlan(env, request, body);
+    }
+
+    /* ── MFA (TOTP) ── */
+    if (route === '/auth/mfa' && request.method === 'GET') return mfaStatus(env, request);
+    if (route === '/auth/mfa/setup' && request.method === 'POST') return mfaSetup(env, request);
+    if (route === '/auth/mfa/confirm' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return mfaConfirm(env, request, body);
+    }
+    if (route === '/auth/mfa/disable' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return mfaDisable(env, request, body);
+    }
 
     /* ── E-signature ── */
     if (route === '/esign/requests' && request.method === 'GET') return listSignatureRequests(env, request, new URL(request.url));

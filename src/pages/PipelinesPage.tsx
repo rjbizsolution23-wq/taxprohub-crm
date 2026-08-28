@@ -8,6 +8,7 @@ import {
   Clock3, Lock, Eye, Trash2, Edit2, Play, Users, BarChart3, PieChart
 } from 'lucide-react';
 import { useAppStore } from '../store';
+import { apiFetch } from '../utils/api';
 import { Deal } from '../types';
 
 // Pipelines configuration
@@ -84,6 +85,39 @@ const pipelinesConfig: Pipeline[] = [
 export default function PipelinesPage() {
   const [activeTab, setActiveTab] = useState<'forecast' | 'tax' | 'book' | 'rep' | 'credit' | 'bureau' | 'recurring' | 'owner' | 'close' | 'map' | 'custom'>('tax');
   const [selectedDealId, setSelectedDealId] = useState<string | null>(null);
+
+  /* ── LIVE deal actions: invoice via Stripe, documents via the e-sign engine ── */
+  const [dealAction, setDealAction] = useState<{ busy: string; message: string }>({ busy: '', message: '' });
+
+  const createInvoiceForDeal = async (deal: any) => {
+    setDealAction({ busy: 'invoice', message: '' });
+    const res = await apiFetch<{ number: string; checkoutUrl: string; stripeError?: string }>('/api/invoices', {
+      method: 'POST',
+      body: JSON.stringify({ dealId: deal.id, contactId: deal.contactId }),
+    });
+    const d: any = res.data || {};
+    setDealAction({
+      busy: '',
+      message: res.ok
+        ? `Invoice ${d.number} created${d.checkoutUrl ? ' — payment link emailed to the client.' : ` (draft: ${d.stripeError || 'no Stripe key'})`}`
+        : (d.hint || d.error || 'Invoice failed — backend not configured.'),
+    });
+  };
+
+  const sendForSignature = async (deal: any, docType: string) => {
+    setDealAction({ busy: docType, message: '' });
+    const res = await apiFetch<{ title: string; signerEmail: string; delivered: boolean }>('/api/esign/requests', {
+      method: 'POST',
+      body: JSON.stringify({ contactId: deal.contactId, dealId: deal.id, docType }),
+    });
+    const d: any = res.data || {};
+    setDealAction({
+      busy: '',
+      message: res.ok
+        ? `“${d.title}” sent to ${d.signerEmail}${d.delivered ? '' : ' (queued — email provider not configured)'}.`
+        : (d.hint || d.error || 'Signature request failed.'),
+    });
+  };
   const [filterText, setFilterText] = useState('');
   const [filterOwner, setFilterOwner] = useState('All');
   const [filterTier, setFilterTier] = useState('All');
@@ -1015,6 +1049,43 @@ export default function PipelinesPage() {
 
             </div>
 
+          </div>
+
+          {/* LIVE Deal Actions — invoice + e-signature run against the edge API */}
+          <div className="px-6 pt-5 border-t border-amber-500/15 bg-neutral-900/60 space-y-3">
+            <div className="flex flex-wrap gap-2.5">
+              <button
+                onClick={() => createInvoiceForDeal(activeDeal)}
+                disabled={dealAction.busy !== ''}
+                className="px-4 py-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-[11px] font-black uppercase tracking-wider disabled:opacity-40"
+              >
+                {dealAction.busy === 'invoice' ? 'Creating…' : 'Create invoice'}
+              </button>
+              <button
+                onClick={() => sendForSignature(activeDeal, 'engagement_letter')}
+                disabled={dealAction.busy !== ''}
+                className="px-4 py-2.5 rounded-xl bg-sky-500/10 border border-sky-500/30 text-sky-300 text-[11px] font-black uppercase tracking-wider disabled:opacity-40"
+              >
+                {dealAction.busy === 'engagement_letter' ? 'Sending…' : 'Send engagement letter'}
+              </button>
+              <button
+                onClick={() => sendForSignature(activeDeal, 'form_8879')}
+                disabled={dealAction.busy !== ''}
+                className="px-4 py-2.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-[11px] font-black uppercase tracking-wider disabled:opacity-40"
+              >
+                {dealAction.busy === 'form_8879' ? 'Sending…' : 'Send Form 8879'}
+              </button>
+              <button
+                onClick={() => sendForSignature(activeDeal, 'consent_7216')}
+                disabled={dealAction.busy !== ''}
+                className="px-4 py-2.5 rounded-xl bg-violet-500/10 border border-violet-500/30 text-violet-300 text-[11px] font-black uppercase tracking-wider disabled:opacity-40"
+              >
+                {dealAction.busy === 'consent_7216' ? 'Sending…' : '§7216 consent'}
+              </button>
+            </div>
+            {dealAction.message && (
+              <p className="text-[11px] font-mono text-amber-300 pb-1">{dealAction.message}</p>
+            )}
           </div>
 
           {/* Drawer Footer Actions */}

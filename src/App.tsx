@@ -15,6 +15,7 @@ import ForgotPasswordPage from './pages/auth/ForgotPasswordPage';
 import ClientPortalPage from './pages/ClientPortalPage';
 import CompliancePage from './pages/CompliancePage';
 import SignPage from './pages/SignPage';
+import SecurityPage from './pages/SecurityPage';
 
 // Main Pages
 import DashboardPage from './pages/DashboardPage';
@@ -214,6 +215,7 @@ function App() {
           
           {/* Enterprise Ecosystem Portal (40 Premium Modules) */}
           <Route path="/compliance" element={<CompliancePage />} />
+          <Route path="/security" element={<SecurityPage />} />
           <Route path="/ecosystem" element={<EcosystemPage />} />
           
           {/* Administration & Customizer Settings */}

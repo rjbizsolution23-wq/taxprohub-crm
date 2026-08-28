@@ -3,7 +3,7 @@ import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { 
   LayoutDashboard, CheckSquare, Users, KanbanSquare, Calendar, MessageSquare, 
   Mail, Zap, Globe, FileText, BookOpen, Star, UserPlus, Folder, 
-  RefreshCw, Wrench, ShieldCheck, Calculator, Award, ScanLine, Wand2, 
+  RefreshCw, Wrench, ShieldCheck, Calculator, Award, ScanLine, Wand2, KeyRound, 
   Bot, Cpu, Layers, Sparkles, TrendingUp, Mic, DollarSign, BarChart3, 
   Activity, Building2, Settings, ScrollText, Shield, Bell, Search, 
   Menu, LogOut, Moon, Sun, Plus, HelpCircle, AlertTriangle, ChevronDown, Video, GraduationCap,
@@ -103,6 +103,7 @@ const navSections: Array<{ title: string; items: NavItem[] }> = [
     title: 'ENTERPRISE',
     items: [
       { name: 'Enterprise Hub', href: '/ecosystem', icon: Layers, badge: '40 modules', color: 'text-[#D4AF37]' },
+      { name: 'Security & Plan', href: '/security', icon: KeyRound, badge: '2FA + limits', badgeColor: 'text-sky-400', color: 'text-sky-400' },
       { name: 'Compliance Center', href: '/compliance', icon: ShieldCheck, badgeKey: 'findings', badge: '20 agents', badgeColor: 'text-emerald-400', color: 'text-emerald-400' },
       { name: 'Client Portal', href: '/portal', icon: Users, badge: 'passwordless', badgeColor: 'text-cyan-400', color: 'text-cyan-400' },
     ],
