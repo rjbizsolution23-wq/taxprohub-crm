@@ -692,6 +692,20 @@ async function stripeWebhook(env: Env, request: Request) {
   }
   const event = JSON.parse(payload);
   if (env.LEDGER) await env.LEDGER.put(`stripe-event:${event.id}`, payload, { expirationTtl: 60 * 60 * 24 * 30 });
+
+  // Reconcile checkout completions against the invoice ledger.
+  if (env.DB && (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded')) {
+    const sessionId = String(event.data?.object?.id || '');
+    const intent = String(event.data?.object?.payment_intent || '');
+    if (sessionId) {
+      const inv = await env.DB.prepare('SELECT id, tenant_id FROM invoices WHERE stripe_session_id = ?')
+        .bind(sessionId).first<Record<string, unknown>>();
+      if (inv) {
+        await markInvoicePaid(env, String(inv.tenant_id), String(inv.id), intent);
+        await audit(env, { tenantId: String(inv.tenant_id), action: 'invoice.paid', resource: 'invoices', resourceId: String(inv.id), details: { sessionId } });
+      }
+    }
+  }
   return json({ ok: true, received: event.type });
 }
 
@@ -776,6 +790,8 @@ function health(env: Env) {
       r2_document_vault: !!env.DOCS,
       cron_engine: !!env.CRON_SECRET,
       compliance_agents: COMPLIANCE_AGENTS.length,
+      esign_engine: true,
+      invoicing: !!env.STRIPE_SECRET_KEY,
       twilio_sms: !!(env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && env.TWILIO_FROM_NUMBER),
       stripe: !!env.STRIPE_SECRET_KEY,
       stripe_webhooks: !!env.STRIPE_WEBHOOK_SECRET,
@@ -1274,11 +1290,26 @@ async function cronTick(env: Env, request: Request) {
       .bind(tn.id).first<Record<string, unknown>>();
     const dueAt = last?.started_at ? new Date(String(last.started_at)).getTime() + 20 * 3_600_000 : 0;
     if (Date.now() >= dueAt) {
-      try { await runComplianceSweep(env, String(tn.id), 'cron'); complianceRuns++; } catch { /* keep the tick alive */ }
+      try {
+        const sweep = await runComplianceSweep(env, String(tn.id), 'cron');
+        complianceRuns++;
+        await sendComplianceDigest(env, String(tn.id), sweep);
+      } catch { /* keep the tick alive */ }
     }
   }
 
-  return json({ ok: true, at: now, ...result, complianceRuns });
+  // housekeeping: expire stale signing links, purge dead sessions
+  let expiredSignatures = 0;
+  try {
+    const res = await env.DB.prepare(
+      `UPDATE signature_requests SET status = 'expired', updated_at = ? WHERE status IN ('sent','viewed') AND expires_at < ?`,
+    ).bind(now, now).run();
+    expiredSignatures = Number((res as any)?.meta?.changes || 0);
+    await env.DB.prepare('DELETE FROM sessions WHERE expires_at < ?').bind(new Date(Date.now() - 7 * 86400000).toISOString()).run();
+    await env.DB.prepare('DELETE FROM portal_tokens WHERE expires_at < ?').bind(new Date(Date.now() - 86400000).toISOString()).run();
+  } catch { /* housekeeping is best-effort */ }
+
+  return json({ ok: true, at: now, ...result, complianceRuns, expiredSignatures });
 }
 
 /* ══════════════ CLIENT PORTAL — passwordless magic-link access ══════════════ */
@@ -1371,8 +1402,19 @@ async function portalMe(env: Env, request: Request) {
   const files = await env.DB!.prepare('SELECT * FROM files WHERE contact_id = ? AND tenant_id = ? ORDER BY created_at DESC')
     .bind(p.contact.id, p.tenantId).all<Record<string, unknown>>();
 
+  const invoices = await env.DB!.prepare(
+    `SELECT id, number, description, amount_cents, status, due_at, checkout_url, paid_at FROM invoices
+     WHERE contact_id = ? AND tenant_id = ? ORDER BY created_at DESC`,
+  ).bind(p.contact.id, p.tenantId).all<Record<string, unknown>>();
+  const signatures = await env.DB!.prepare(
+    `SELECT id, title, doc_type, status, expires_at, signed_at FROM signature_requests
+     WHERE contact_id = ? AND tenant_id = ? ORDER BY created_at DESC`,
+  ).bind(p.contact.id, p.tenantId).all<Record<string, unknown>>();
+
   return json({
     ok: true,
+    invoices: invoices.results || [],
+    signatures: signatures.results || [],
     contact: {
       id: p.contact.id, firstName: p.contact.first_name, lastName: p.contact.last_name,
       email: p.contact.email, phone: p.contact.phone, status: p.contact.status,
@@ -2179,6 +2221,47 @@ async function runComplianceSweep(env: Env, tenantId: string, trigger: 'manual' 
   return { runId, agentsRun: roster.length, opened, resolved, score, bySeverity, perAgent };
 }
 
+
+/** Daily compliance digest — emailed to tenant admins after each cron sweep. */
+async function sendComplianceDigest(env: Env, tenantId: string, sweep: { score: number; opened: number; resolved: number; bySeverity: Record<string, number> }) {
+  if (!env.DB) return;
+  const admins = await env.DB.prepare(`SELECT email, name FROM users WHERE tenant_id = ? AND role = 'admin' AND status = 'active'`)
+    .bind(tenantId).all<Record<string, unknown>>();
+  const recipients = (admins.results || []).map((u) => String(u.email)).filter(Boolean);
+  if (!recipients.length) return;
+
+  const tenant = await env.DB.prepare('SELECT name, business_name FROM tenants WHERE id = ?').bind(tenantId).first<Record<string, unknown>>() || {};
+  const critical = await env.DB.prepare(
+    `SELECT title, agent_key, remediation FROM compliance_findings WHERE tenant_id = ? AND status = 'open'
+     ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END LIMIT 10`,
+  ).bind(tenantId).all<Record<string, unknown>>();
+
+  const lines = [
+    `Daily compliance digest — ${tenant.business_name || tenant.name || 'your practice'}`,
+    `${new Date().toLocaleDateString()}`,
+    '',
+    `Compliance score: ${sweep.score}/100`,
+    `Open findings — critical ${sweep.bySeverity.critical || 0} · high ${sweep.bySeverity.high || 0} · medium ${sweep.bySeverity.medium || 0} · low ${sweep.bySeverity.low || 0}`,
+    `New today: ${sweep.opened} · auto-resolved: ${sweep.resolved}`,
+    '',
+    'Top priorities:',
+    ...(critical.results || []).map((f, i) => `  ${i + 1}. [${f.agent_key}] ${f.title}\n     Fix: ${f.remediation}`),
+    '',
+    'Open the Compliance Command Center to resolve or waive each item.',
+  ];
+  const body = lines.join('\n');
+  const subject = `Compliance ${sweep.score}/100 — ${sweep.bySeverity.critical || 0} critical, ${sweep.bySeverity.high || 0} high`;
+
+  let delivered = false;
+  for (const to of recipients.slice(0, 10)) {
+    const res = await safeSendEmail(env, { to, subject, text: body });
+    delivered = delivered || res.ok;
+  }
+  await env.DB.prepare(
+    `INSERT INTO digests (id, tenant_id, kind, sent_to, subject, body, delivered, created_at) VALUES (?, ?, 'compliance_daily', ?, ?, ?, ?, ?)`,
+  ).bind(uuid(), tenantId, recipients.join(','), subject, body, delivered ? 1 : 0, nowIso()).run();
+}
+
 async function complianceOverview(env: Env, request: Request) {
   const a = await auth(env, request);
   if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
@@ -2319,6 +2402,387 @@ async function liveStream(env: Env, request: Request) {
   });
 }
 
+
+/* ═════════════ E-SIGNATURE (ESIGN Act / UETA compliant) ═════════════
+ * Tamper-evident: the exact document text presented to the signer is hashed
+ * (SHA-256) at creation and re-verified at signing. Every touch is written to
+ * signature_events with IP + user agent, producing an audit certificate that
+ * satisfies 15 U.S.C. §7001(a) and UETA §12 record-retention requirements.
+ */
+
+const SIGN_TTL_DAYS = 14;
+
+const ESIGN_DISCLOSURE =
+  'By typing your name below you agree to sign this record electronically under the ' +
+  'Electronic Signatures in Global and National Commerce Act (15 U.S.C. §7001) and applicable ' +
+  'state UETA. You may request a paper copy at no charge and may withdraw consent before signing ' +
+  'by contacting the practice. Your typed name, the time, your IP address and a hash of the exact ' +
+  'document shown to you are recorded as the signature certificate.';
+
+function renderStandardDocument(kind: string, ctx: { contact: any; tenant: any; deal: any }) {
+  const client = `${ctx.contact?.first_name || ''} ${ctx.contact?.last_name || ''}`.trim() || 'Client';
+  const firm = ctx.tenant?.business_name || ctx.tenant?.name || 'the Firm';
+  const year = new Date().getFullYear();
+  const fee = ctx.deal?.value ? `$${Number(ctx.deal.value).toLocaleString()}` : 'the agreed fee';
+
+  switch (kind) {
+    case 'form_8879':
+      return [
+        `IRS e-file Signature Authorization (Form 8879) — Tax Year ${year - 1}`,
+        '',
+        `Taxpayer: ${client}`,
+        `Electronic Return Originator: ${firm}`,
+        '',
+        'Under penalties of perjury, I declare that I have examined a copy of my electronic individual',
+        'income tax return and accompanying schedules and statements for the tax year stated above, and',
+        'to the best of my knowledge and belief, it is true, correct, and complete.',
+        '',
+        'I consent to allow my intermediate service provider, transmitter, or electronic return originator',
+        'to send my return to the IRS and to receive from the IRS (a) an acknowledgement of receipt or',
+        'reason for rejection of the transmission, (b) the reason for any delay in processing the return',
+        'or refund, and (c) the date of any refund.',
+        '',
+        'I authorize the ERO named above to enter or generate my PIN as my signature on my electronically',
+        'filed income tax return.',
+      ].join('\n');
+
+    case 'consent_7216':
+      return [
+        `Consent to Use and Disclose Tax Return Information — §7216`,
+        '',
+        `Federal law requires this consent form be provided to you. Unless authorized by law, ${firm}`,
+        'cannot use, without your consent, your tax return information for purposes other than the',
+        'preparation and filing of your tax return.',
+        '',
+        'You are not required to complete this form. If we obtain your signature on this form by',
+        'conditioning our services on your consent, your consent will not be valid. Your consent is',
+        'valid for the amount of time you specify; if you do not specify a duration, it is valid for one year.',
+        '',
+        `I, ${client}, authorize ${firm} to use the information I provide during the preparation of my`,
+        'return for the purpose of offering additional financial, bookkeeping, advisory and lending',
+        'services, and to disclose that information to affiliated service providers for those purposes.',
+      ].join('\n');
+
+    case 'croa_disclosure':
+      return [
+        'Consumer Credit File Rights Under State and Federal Law',
+        '',
+        'You have a right to dispute inaccurate information in your credit report by contacting the credit',
+        'bureau directly. However, neither you nor any credit repair company or credit repair organization',
+        'has the right to have accurate, current, and verifiable information removed from your credit report.',
+        '',
+        'You have a right to obtain a copy of your credit report from a credit bureau. You may be charged a',
+        'reasonable fee. There is no fee, however, if you have been turned down for credit, employment,',
+        'insurance, or a rental dwelling because of information in your credit report within the preceding',
+        '60 days.',
+        '',
+        'You have a right to cancel your contract with any credit repair organization for any reason within',
+        '3 business days from the date you signed it.',
+        '',
+        `Provided by ${firm}.`,
+      ].join('\n');
+
+    default:
+      return [
+        `Engagement Letter — ${firm}`,
+        '',
+        `Client: ${client}`,
+        `Engagement: ${ctx.deal?.name || 'Tax and advisory services'}`,
+        `Fee: ${fee}`,
+        '',
+        `This letter confirms the terms of the engagement between ${client} and ${firm}.`,
+        '',
+        'SCOPE. We will prepare the returns and perform the advisory services described above based on',
+        'information you provide. We will not audit or verify the data you submit, although we may ask for',
+        'clarification of some information.',
+        '',
+        'RESPONSIBILITIES. You are responsible for the accuracy and completeness of the records and',
+        'representations provided, and for maintaining documentation supporting all items reported.',
+        '',
+        'FEES. Fees are due upon delivery unless otherwise agreed. Additional work outside this scope will',
+        'be billed separately after written approval.',
+        '',
+        'RECORD RETENTION. We retain engagement records for seven years, after which they are securely destroyed.',
+        '',
+        'PRIVACY. We are required to keep your information confidential under Circular 230, IRC §7216 and',
+        'the Gramm-Leach-Bliley Act.',
+      ].join('\n');
+  }
+}
+
+async function createSignatureRequest(env: Env, request: Request, body: Record<string, any>) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+
+  const contactId = String(body.contactId || '');
+  if (!contactId) return bad('contactId_required');
+  const contact = await env.DB.prepare('SELECT * FROM contacts WHERE id = ? AND tenant_id = ?')
+    .bind(contactId, a.tenant.id).first<Record<string, any>>();
+  if (!contact) return json({ ok: false, error: 'contact_not_found' }, 404);
+  const email = String(body.signerEmail || contact.email || '');
+  if (!email) return bad('signer_email_required');
+
+  const deal = body.dealId
+    ? await env.DB.prepare('SELECT * FROM deals WHERE id = ? AND tenant_id = ?').bind(body.dealId, a.tenant.id).first<Record<string, any>>()
+    : null;
+  const tenantRow = await env.DB.prepare('SELECT * FROM tenants WHERE id = ?').bind(a.tenant.id).first<Record<string, any>>() || {};
+
+  const docType = String(body.docType || 'engagement_letter');
+  const bodyText = String(body.body || renderStandardDocument(docType, { contact, tenant: tenantRow, deal }));
+  const title = String(body.title || {
+    form_8879: 'IRS e-file Signature Authorization (Form 8879)',
+    consent_7216: 'Consent to Use and Disclose Tax Return Information (§7216)',
+    croa_disclosure: 'Consumer Credit File Rights Disclosure (CROA)',
+  }[docType] || 'Engagement Letter');
+
+  const token = randHex(32);
+  const id = uuid();
+  const now = nowIso();
+  const expires = new Date(Date.now() + SIGN_TTL_DAYS * 86400000).toISOString();
+
+  await env.DB.prepare(
+    `INSERT INTO signature_requests (id, tenant_id, contact_id, deal_id, file_id, doc_type, title, body, body_sha256,
+       signer_name, signer_email, token_hash, status, expires_at, created_by, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?)`,
+  ).bind(id, a.tenant.id, contactId, body.dealId || null, body.fileId || null, docType, title, bodyText,
+    await sha256(bodyText), `${contact.first_name || ''} ${contact.last_name || ''}`.trim(), email,
+    await sha256(token), expires, a.user.id, now, now).run();
+
+  await env.DB.prepare(
+    `INSERT INTO signature_events (id, tenant_id, request_id, event, ip, user_agent, detail, created_at)
+     VALUES (?, ?, ?, 'created', ?, ?, ?, ?)`,
+  ).bind(uuid(), a.tenant.id, id, request.headers.get('CF-Connecting-IP') || '', request.headers.get('User-Agent') || '',
+    JSON.stringify({ by: a.user.email, docType }), now).run();
+
+  const base = env.PORTAL_BASE_URL || new URL(request.url).origin;
+  const link = `${base}/#/sign?token=${token}`;
+  const mail = await safeSendEmail(env, {
+    to: email,
+    subject: `Signature requested: ${title} — ${tenantRow.business_name || tenantRow.name || 'your tax team'}`,
+    text: `Hello ${contact.first_name || ''},\n\n${tenantRow.business_name || tenantRow.name || 'Your tax team'} has sent "${title}" for your electronic signature.\n\nOpen and sign here (expires in ${SIGN_TTL_DAYS} days):\n${link}\n\n${ESIGN_DISCLOSURE}`,
+  });
+
+  await audit(env, { tenantId: String(a.tenant.id), userId: String(a.user.id), action: 'esign.request', resource: 'signature_requests', resourceId: id, details: { docType, email, delivered: mail.ok }, request });
+  return json({ ok: true, id, title, signerEmail: email, expiresAt: expires, delivered: mail.ok, link }, 201);
+}
+
+async function listSignatureRequests(env: Env, request: Request, url: URL) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const contactId = url.searchParams.get('contactId');
+  const where = contactId ? 'tenant_id = ? AND contact_id = ?' : 'tenant_id = ?';
+  const binds = contactId ? [a.tenant.id, contactId] : [a.tenant.id];
+  const rows = await env.DB.prepare(
+    `SELECT id, contact_id, deal_id, doc_type, title, signer_name, signer_email, status, expires_at,
+            signed_at, signature_name, signature_ip, created_at FROM signature_requests
+     WHERE ${where} ORDER BY created_at DESC LIMIT 200`,
+  ).bind(...binds).all<Record<string, unknown>>();
+  return json({ ok: true, items: rows.results || [] });
+}
+
+/** Public: fetch the document behind a signing link (no session required). */
+async function getSignatureByToken(env: Env, request: Request, token: string) {
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const row = await env.DB.prepare('SELECT * FROM signature_requests WHERE token_hash = ?')
+    .bind(await sha256(token)).first<Record<string, any>>();
+  if (!row) return json({ ok: false, error: 'invalid_link' }, 404);
+  if (row.status === 'signed') {
+    return json({ ok: true, status: 'signed', title: row.title, body: row.body, signedAt: row.signed_at, signatureName: row.signature_name, disclosure: ESIGN_DISCLOSURE });
+  }
+  if (String(row.expires_at) < nowIso()) return json({ ok: false, error: 'link_expired' }, 410);
+
+  const tenant = await env.DB.prepare('SELECT name, business_name, email, phone FROM tenants WHERE id = ?').bind(row.tenant_id).first<Record<string, any>>() || {};
+  if (row.status === 'sent') {
+    await env.DB.prepare(`UPDATE signature_requests SET status = 'viewed', updated_at = ? WHERE id = ?`).bind(nowIso(), row.id).run();
+    await env.DB.prepare(
+      `INSERT INTO signature_events (id, tenant_id, request_id, event, ip, user_agent, detail, created_at) VALUES (?, ?, ?, 'viewed', ?, ?, '{}', ?)`,
+    ).bind(uuid(), row.tenant_id, row.id, request.headers.get('CF-Connecting-IP') || '', request.headers.get('User-Agent') || '', nowIso()).run();
+  }
+
+  return json({
+    ok: true, status: 'pending', title: row.title, body: row.body, docType: row.doc_type,
+    signerName: row.signer_name, signerEmail: row.signer_email, expiresAt: row.expires_at,
+    practice: { name: tenant.business_name || tenant.name, email: tenant.email, phone: tenant.phone },
+    disclosure: ESIGN_DISCLOSURE,
+  });
+}
+
+/** Public: adopt and apply the signature. */
+async function signByToken(env: Env, request: Request, body: Record<string, any>) {
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const token = String(body.token || '');
+  const typedName = String(body.signatureName || '').trim();
+  if (!token) return bad('token_required');
+  if (typedName.length < 2) return bad('signature_name_required');
+  if (!body.consent) return bad('esign_consent_required');
+
+  const row = await env.DB.prepare('SELECT * FROM signature_requests WHERE token_hash = ?')
+    .bind(await sha256(token)).first<Record<string, any>>();
+  if (!row) return json({ ok: false, error: 'invalid_link' }, 404);
+  if (row.status === 'signed') return json({ ok: false, error: 'already_signed' }, 409);
+  if (String(row.expires_at) < nowIso()) return json({ ok: false, error: 'link_expired' }, 410);
+
+  // Tamper check: the stored body must still hash to the recorded value.
+  const currentHash = await sha256(String(row.body || ''));
+  if (currentHash !== String(row.body_sha256)) {
+    return json({ ok: false, error: 'document_integrity_failure' }, 409);
+  }
+
+  const now = nowIso();
+  const ip = request.headers.get('CF-Connecting-IP') || '';
+  const ua = request.headers.get('User-Agent') || '';
+  const certificate = {
+    requestId: row.id,
+    documentTitle: row.title,
+    documentSha256: row.body_sha256,
+    signerName: typedName,
+    signerEmail: row.signer_email,
+    signedAt: now,
+    ip, userAgent: ua,
+    esignConsent: true,
+    disclosurePresented: ESIGN_DISCLOSURE,
+    authority: 'ESIGN Act 15 U.S.C. §7001; UETA §7',
+  };
+
+  await env.DB.prepare(
+    `UPDATE signature_requests SET status = 'signed', signed_at = ?, signature_name = ?, signature_ip = ?,
+       signature_ua = ?, consent_esign = 1, certificate = ?, updated_at = ? WHERE id = ?`,
+  ).bind(now, typedName, ip, ua, JSON.stringify(certificate), now, row.id).run();
+
+  await env.DB.prepare(
+    `INSERT INTO signature_events (id, tenant_id, request_id, event, ip, user_agent, detail, created_at)
+     VALUES (?, ?, ?, 'signed', ?, ?, ?, ?)`,
+  ).bind(uuid(), row.tenant_id, row.id, ip, ua, JSON.stringify({ signerName: typedName }), now).run();
+
+  // Archive the executed record into the vault so compliance agents can see it.
+  if (env.DOCS) {
+    const text = `${row.title}\n${'='.repeat(String(row.title).length)}\n\n${row.body}\n\n---\nELECTRONIC SIGNATURE CERTIFICATE\n${JSON.stringify(certificate, null, 2)}\n`;
+    const fileId = uuid();
+    const safeName = `${String(row.doc_type)}-signed-${row.id.slice(0, 8)}.txt`;
+    const key = `tenants/${row.tenant_id}/${fileId}/${safeName}`;
+    const bytes = new TextEncoder().encode(text);
+    await env.DOCS.put(key, bytes, { httpMetadata: { contentType: 'text/plain' }, customMetadata: { signed: 'true', requestId: String(row.id) } });
+    const digest = await crypto.subtle.digest('SHA-256', bytes);
+    await env.DB.prepare(
+      `INSERT INTO files (id, tenant_id, contact_id, deal_id, name, folder, doc_type, content_type, size, r2_key, sha256, uploaded_by, status, metadata, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 'Signed Agreements', ?, 'text/plain', ?, ?, ?, 'esign', 'stored', ?, ?, ?)`,
+    ).bind(fileId, row.tenant_id, row.contact_id, row.deal_id, safeName, row.doc_type, bytes.length, key,
+      Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join(''),
+      JSON.stringify({ signatureRequestId: row.id }), now, now).run();
+    await env.DB.prepare('UPDATE signature_requests SET file_id = COALESCE(file_id, ?) WHERE id = ?').bind(fileId, row.id).run();
+  }
+
+  await audit(env, { tenantId: String(row.tenant_id), action: 'esign.signed', resource: 'signature_requests', resourceId: String(row.id), details: { signerName: typedName }, request });
+  return json({ ok: true, status: 'signed', signedAt: now, certificate });
+}
+
+async function signatureCertificate(env: Env, request: Request, id: string) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const row = await env.DB.prepare('SELECT * FROM signature_requests WHERE id = ? AND tenant_id = ?')
+    .bind(id, a.tenant.id).first<Record<string, any>>();
+  if (!row) return json({ ok: false, error: 'not_found' }, 404);
+  const events = await env.DB.prepare('SELECT event, ip, user_agent, detail, created_at FROM signature_events WHERE request_id = ? ORDER BY created_at')
+    .bind(id).all<Record<string, unknown>>();
+  return json({ ok: true, request: row, certificate: safeJson(row.certificate, {}), events: events.results || [] });
+}
+
+/* ═════════════════════ INVOICING (Stripe-backed) ═════════════════════ */
+
+async function createInvoice(env: Env, request: Request, body: Record<string, any>) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+
+  const deal = body.dealId
+    ? await env.DB.prepare('SELECT * FROM deals WHERE id = ? AND tenant_id = ?').bind(body.dealId, a.tenant.id).first<Record<string, any>>()
+    : null;
+  const contactId = String(body.contactId || deal?.contact_id || '');
+  const contact = contactId
+    ? await env.DB.prepare('SELECT * FROM contacts WHERE id = ? AND tenant_id = ?').bind(contactId, a.tenant.id).first<Record<string, any>>()
+    : null;
+
+  const amountCents = Number(body.amountCents ?? Math.round(Number(deal?.value || 0) * 100));
+  if (!amountCents || amountCents < 50) return bad('amount_must_exceed_50_cents');
+
+  const seq = await env.DB.prepare('SELECT COUNT(*) AS n FROM invoices WHERE tenant_id = ?').bind(a.tenant.id).first<Record<string, unknown>>();
+  const number = `INV-${new Date().getFullYear()}-${String(Number(seq?.n || 0) + 1).padStart(4, '0')}`;
+  const description = String(body.description || deal?.name || 'Professional services');
+  const id = uuid();
+  const now = nowIso();
+  const dueAt = String(body.dueAt || new Date(Date.now() + 14 * 86400000).toISOString());
+
+  let checkoutUrl = ''; let sessionId = ''; let stripeError = '';
+  const origin = env.PORTAL_BASE_URL || new URL(request.url).origin;
+  if (env.STRIPE_SECRET_KEY) {
+    try {
+      const res = await stripeCheckout(env, {
+        amountCents,
+        description: `${number} — ${description}`,
+        successUrl: `${origin}/#/portal?paid=${id}`,
+        cancelUrl: `${origin}/#/portal?cancelled=${id}`,
+        customerEmail: contact?.email || undefined,
+      });
+      const data = await res.clone().json().catch(() => ({})) as Record<string, any>;
+      checkoutUrl = String(data.url || ''); sessionId = String(data.sessionId || '');
+      if (!checkoutUrl) stripeError = String(data.error || 'stripe_no_url');
+    } catch (e) { stripeError = String(e).slice(0, 160); }
+  } else {
+    stripeError = 'STRIPE_SECRET_KEY not configured — invoice saved as draft without a payment link.';
+  }
+
+  await env.DB.prepare(
+    `INSERT INTO invoices (id, tenant_id, contact_id, deal_id, number, description, line_items, amount_cents,
+       currency, status, due_at, checkout_url, stripe_session_id, created_by, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'usd', ?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(id, a.tenant.id, contactId || null, body.dealId || null, number, description,
+    JSON.stringify(body.lineItems || [{ description, amountCents }]), amountCents,
+    checkoutUrl ? 'sent' : 'draft', dueAt, checkoutUrl, sessionId, a.user.id, now, now).run();
+
+  if (checkoutUrl && contact?.email && body.email !== false) {
+    await safeSendEmail(env, {
+      to: contact.email,
+      subject: `Invoice ${number} from ${a.tenant.businessName || a.tenant.name}`,
+      text: `Hello ${contact.first_name || ''},\n\nInvoice ${number} for ${description} — $${(amountCents / 100).toFixed(2)}.\n\nPay securely:\n${checkoutUrl}\n\nDue ${new Date(dueAt).toLocaleDateString()}.`,
+    });
+    await env.DB.prepare('UPDATE invoices SET sent_at = ? WHERE id = ?').bind(now, id).run();
+  }
+
+  await audit(env, { tenantId: String(a.tenant.id), userId: String(a.user.id), action: 'invoice.create', resource: 'invoices', resourceId: id, details: { number, amountCents }, request });
+  return json({ ok: true, id, number, amountCents, checkoutUrl, status: checkoutUrl ? 'sent' : 'draft', stripeError: stripeError || undefined }, 201);
+}
+
+async function listInvoices(env: Env, request: Request, url: URL) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const contactId = url.searchParams.get('contactId');
+  const where = contactId ? 'tenant_id = ? AND contact_id = ?' : 'tenant_id = ?';
+  const binds = contactId ? [a.tenant.id, contactId] : [a.tenant.id];
+  const rows = await env.DB.prepare(`SELECT * FROM invoices WHERE ${where} ORDER BY created_at DESC LIMIT 200`).bind(...binds).all<Record<string, unknown>>();
+  const totals = await env.DB.prepare(
+    `SELECT status, COUNT(*) AS n, SUM(amount_cents) AS cents FROM invoices WHERE tenant_id = ? GROUP BY status`,
+  ).bind(a.tenant.id).all<Record<string, unknown>>();
+  return json({ ok: true, items: rows.results || [], totals: totals.results || [] });
+}
+
+async function markInvoicePaid(env: Env, tenantId: string, invoiceId: string, paymentIntent?: string) {
+  if (!env.DB) return;
+  const now = nowIso();
+  await env.DB.prepare(
+    `UPDATE invoices SET status = 'paid', paid_at = ?, stripe_payment_intent = ?, updated_at = ? WHERE id = ? AND tenant_id = ?`,
+  ).bind(now, paymentIntent || '', now, invoiceId, tenantId).run();
+  const inv = await env.DB.prepare('SELECT * FROM invoices WHERE id = ?').bind(invoiceId).first<Record<string, any>>();
+  if (inv?.deal_id) {
+    // Paid engagements are closed-won and 100% probability.
+    await env.DB.prepare(`UPDATE deals SET probability = 100, updated_at = ? WHERE id = ? AND tenant_id = ?`)
+      .bind(now, inv.deal_id, tenantId).run();
+  }
+}
+
 /* ═══════════════════════════ ROUTER ═══════════════════════════ */
 export const onRequest = async (ctx: Ctx): Promise<Response> => {
   const { request, env, params } = ctx;
@@ -2347,6 +2811,30 @@ export const onRequest = async (ctx: Ctx): Promise<Response> => {
 
     /* ── Bootstrap ── */
     if (route === '/v1/bootstrap' && request.method === 'GET') return handleBootstrap(env, request);
+
+    /* ── E-signature ── */
+    if (route === '/esign/requests' && request.method === 'GET') return listSignatureRequests(env, request, new URL(request.url));
+    if (route === '/esign/requests' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return createSignatureRequest(env, request, body);
+    }
+    if (/^\/esign\/requests\/[^/]+\/certificate$/.test(route) && request.method === 'GET') {
+      return signatureCertificate(env, request, route.split('/')[3]);
+    }
+    if (route.startsWith('/esign/document/') && request.method === 'GET') {
+      return getSignatureByToken(env, request, route.split('/')[3]);
+    }
+    if (route === '/esign/sign' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return signByToken(env, request, body);
+    }
+
+    /* ── Invoicing ── */
+    if (route === '/invoices' && request.method === 'GET') return listInvoices(env, request, new URL(request.url));
+    if (route === '/invoices' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return createInvoice(env, request, body);
+    }
 
     /* ── Live event stream (SSE) ── */
     if (route === '/stream' && request.method === 'GET') return liveStream(env, request);

@@ -12,7 +12,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
   ShieldCheck, Mail, LogIn, Upload, FileText, Download, CalendarDays,
-  Briefcase, Loader2, CheckCircle2, AlertTriangle, LogOut,
+  Briefcase, Loader2, CheckCircle2, AlertTriangle, LogOut, Receipt, PenLine, ExternalLink,
 } from 'lucide-react';
 import { humanSize } from '../utils/vault';
 
@@ -22,7 +22,17 @@ interface PortalFile {
   id: string; name: string; folder: string; docType: string;
   size: number; createdAt: string;
 }
+interface PortalInvoice {
+  id: string; number: string; description: string; amount_cents: number;
+  status: string; due_at: string | null; checkout_url: string | null; paid_at: string | null;
+}
+interface PortalSignature {
+  id: string; title: string; doc_type: string; status: string;
+  expires_at: string; signed_at: string | null;
+}
 interface PortalData {
+  invoices: PortalInvoice[];
+  signatures: PortalSignature[];
   contact: { id: string; firstName: string; lastName: string; email: string; phone: string; status: string };
   practice: { name: string; email: string; phone: string };
   deals: { id: string; name: string; stage_id: string; value: number; updated_at: string }[];
@@ -254,6 +264,65 @@ export default function ClientPortalPage() {
                     <div className="text-[11px] text-gray-500">{f.folder} · {humanSize(f.size)} · {new Date(f.createdAt).toLocaleString()}</div>
                   </div>
                   <button onClick={() => download(f)} className="p-2 rounded-xl hover:bg-white/10 text-gray-300"><Download className="w-4 h-4" /></button>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+
+        {/* Signature requests */}
+        <section className="rounded-3xl border border-white/10 bg-white/[0.03] p-6">
+          <h2 className="text-lg font-bold flex items-center gap-2 mb-4"><PenLine className="w-4 h-4 text-amber-400" /> Documents to sign</h2>
+          {(d.signatures || []).length === 0 ? (
+            <p className="text-xs text-gray-500">Nothing awaiting your signature.</p>
+          ) : (
+            <div className="space-y-2">
+              {(d.signatures || []).map((sg) => (
+                <div key={sg.id} className="flex items-center justify-between gap-3 py-2 border-b border-white/5 last:border-0">
+                  <div className="min-w-0">
+                    <div className="text-sm truncate">{sg.title}</div>
+                    <div className="text-[11px] text-gray-500">
+                      {sg.status === 'signed'
+                        ? `Signed ${sg.signed_at ? new Date(sg.signed_at).toLocaleDateString() : ''}`
+                        : `Expires ${new Date(sg.expires_at).toLocaleDateString()}`}
+                    </div>
+                  </div>
+                  <span className={`text-[10px] font-mono uppercase px-2 py-1 rounded-lg border ${sg.status === 'signed' ? 'border-emerald-500/30 text-emerald-300 bg-emerald-500/10' : 'border-amber-500/30 text-amber-300 bg-amber-500/10'}`}>
+                    {sg.status}
+                  </span>
+                </div>
+              ))}
+              <p className="text-[10px] text-gray-600 pt-2">Signing links are emailed to you individually for security.</p>
+            </div>
+          )}
+        </section>
+
+        {/* Invoices */}
+        <section className="rounded-3xl border border-white/10 bg-white/[0.03] p-6">
+          <h2 className="text-lg font-bold flex items-center gap-2 mb-4"><Receipt className="w-4 h-4 text-amber-400" /> Invoices</h2>
+          {(d.invoices || []).length === 0 ? (
+            <p className="text-xs text-gray-500">No invoices yet.</p>
+          ) : (
+            <div className="space-y-2">
+              {(d.invoices || []).map((inv) => (
+                <div key={inv.id} className="flex items-center justify-between gap-3 py-2 border-b border-white/5 last:border-0">
+                  <div className="min-w-0">
+                    <div className="text-sm truncate">{inv.number} · {inv.description}</div>
+                    <div className="text-[11px] text-gray-500">
+                      ${(inv.amount_cents / 100).toFixed(2)}
+                      {inv.paid_at ? ` · paid ${new Date(inv.paid_at).toLocaleDateString()}` : inv.due_at ? ` · due ${new Date(inv.due_at).toLocaleDateString()}` : ''}
+                    </div>
+                  </div>
+                  {inv.status === 'paid' ? (
+                    <span className="text-[10px] font-mono uppercase px-2 py-1 rounded-lg border border-emerald-500/30 text-emerald-300 bg-emerald-500/10">paid</span>
+                  ) : inv.checkout_url ? (
+                    <a href={inv.checkout_url} target="_blank" rel="noreferrer"
+                      className="text-[10px] font-black uppercase tracking-wider px-3 py-1.5 rounded-xl bg-gradient-to-r from-amber-500 to-yellow-400 text-black flex items-center gap-1">
+                      Pay <ExternalLink className="w-3 h-3" />
+                    </a>
+                  ) : (
+                    <span className="text-[10px] font-mono uppercase px-2 py-1 rounded-lg border border-slate-600 text-slate-400">{inv.status}</span>
+                  )}
                 </div>
               ))}
             </div>

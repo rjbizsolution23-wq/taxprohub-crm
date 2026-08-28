@@ -138,6 +138,44 @@ Functions) against **D1** with per-tenant isolation:
 Full audit & architecture: [`ANALYSIS.md`](./ANALYSIS.md) ·
 Deployment: [`docs/DEPLOYMENT_RUNBOOK.md`](./docs/DEPLOYMENT_RUNBOOK.md)
 
+## ✍️ E-SIGNATURE ENGINE (ESIGN Act / UETA)
+
+Send engagement letters, **Form 8879**, §7216 consents and CROA disclosures for
+electronic signature — no third-party e-sign vendor, no per-envelope fee.
+
+* Document text is rendered server-side and **SHA-256 hashed at creation**; the
+  hash is re-verified at signing, so a tampered record is refused (`document_integrity_failure`).
+* Public ceremony at `/#/sign?token=…`: full document, ESIGN disclosure, explicit
+  consent checkbox, typed-signature adoption.
+* Certificate records adopted name, timestamp, **IP address**, user agent and the
+  document hash — cited to 15 U.S.C. §7001 and UETA §7.
+* Every touch (`created → viewed → signed`) is written to `signature_events`.
+* The executed record + certificate is **auto-filed to the R2 vault** under
+  "Signed Agreements", which in turn clears the Engagement Letter compliance finding.
+
+| Route | Purpose |
+|---|---|
+| `POST /api/esign/requests` | send for signature (`docType`: engagement_letter, form_8879, consent_7216, croa_disclosure, custom) |
+| `GET /api/esign/document/:token` | public signing view (marks viewed) |
+| `POST /api/esign/sign` | adopt + sign |
+| `GET /api/esign/requests/:id/certificate` | certificate + full event trail |
+
+## 🧾 INVOICING (Stripe, tied to deals)
+
+`POST /api/invoices` turns a deal into a numbered invoice (`INV-YYYY-####`),
+opens a Stripe Checkout session, emails the pay link, and records it in D1. The
+Stripe webhook reconciles `checkout.session.completed` → invoice `paid` → the
+linked **deal moves to 100% probability**. Clients see and pay invoices in the
+portal. Without `STRIPE_SECRET_KEY` the invoice is saved as a draft with an
+honest error instead of a fake payment link.
+
+## 📬 DAILY COMPLIANCE DIGEST
+
+After each cron sweep, tenant admins get an emailed digest: score, severity
+breakdown, new vs auto-resolved counts, and the top 10 findings with their fixes.
+Every digest is archived in the `digests` table with a delivery flag. The tick
+also expires stale signing links and purges dead sessions/portal tokens.
+
 ## 🛡️ COMPLIANCE COMMAND CENTER — 1 chief + 24 specialist agents
 
 `/#/compliance` — a Chief Compliance Orchestrator supervising **24 specialist
