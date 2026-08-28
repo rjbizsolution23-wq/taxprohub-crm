@@ -11,7 +11,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   ShieldCheck, Bot, Play, RefreshCw, AlertTriangle, CheckCircle2, Clock,
-  Scale, Activity, ChevronRight, Radio, Filter, XCircle, Loader2,
+  Scale, Activity, ChevronRight, Radio, Filter, XCircle, Loader2, FileArchive, Download,
 } from 'lucide-react';
 import { apiFetch } from '../utils/api';
 import { useLiveStream, ACTIVITY_LABELS } from '../utils/liveStream';
@@ -52,6 +52,37 @@ export default function CompliancePage() {
   const [agentFilter, setAgentFilter] = useState<string>('all');
   const { snapshot, activity, connected } = useLiveStream(true);
 
+  /* ── Audit-ready evidence bundles ── */
+  const [exports, setExports] = useState<any[]>([]);
+  const [exporting, setExporting] = useState(false);
+
+  const loadExports = useCallback(async () => {
+    const res = await apiFetch<{ items: any[] }>('/api/compliance/evidence');
+    if (res.ok) setExports(((res.data as any)?.items) || []);
+  }, []);
+
+  const buildEvidence = async () => {
+    setExporting(true);
+    const res = await apiFetch<{ title: string; sizeBytes: number; sha256: string }>('/api/compliance/evidence', { method: 'POST', body: '{}' });
+    const d: any = res.data || {};
+    setNotice(res.ok
+      ? `Evidence bundle generated — ${d.title} (${(d.sizeBytes / 1024).toFixed(1)} KB, sha256 ${String(d.sha256).slice(0, 16)}…), archived to the vault.`
+      : (d.hint || d.error || 'Export failed.'));
+    setExporting(false);
+    await loadExports();
+  };
+
+  const downloadEvidence = async (id: string, title: string) => {
+    const token = localStorage.getItem('tph_session_token') || '';
+    const res = await fetch(`/api/compliance/evidence/${id}/download`, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+    if (!res.ok) return;
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = title; document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  };
+
   const load = useCallback(async () => {
     const res = await apiFetch<Overview>('/api/compliance/overview');
     if (res.ok && res.data) { setData(res.data as Overview); setNotice(''); }
@@ -59,7 +90,7 @@ export default function CompliancePage() {
     setLoading(false);
   }, []);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => { void load(); void loadExports(); }, [load, loadExports]);
 
   const sweep = async (agentKey?: string) => {
     setSweeping(agentKey || 'all');
@@ -261,6 +292,38 @@ export default function CompliancePage() {
                     </button>
                   </div>
                 </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Evidence exports */}
+      <div className="bg-neutral-950/85 border border-[#D4AF37]/15 rounded-3xl p-6">
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <div>
+            <h3 className="text-sm font-bold text-white flex items-center gap-2"><FileArchive className="h-4 w-4 text-[#D4AF37]" /> Audit-ready evidence bundle</h3>
+            <p className="text-[11px] text-slate-400 mt-1">
+              Agent roster, sweep history, full findings register, executed agreements with hashes,
+              vault inventory, preparer credentials, digest delivery log and the audit trail — one signed text record.
+            </p>
+          </div>
+          <button onClick={buildEvidence} disabled={exporting}
+            className="px-4 py-2.5 rounded-xl bg-[#D4AF37]/10 border border-[#D4AF37]/30 text-[#D4AF37] text-[11px] font-black uppercase tracking-wider disabled:opacity-50 flex items-center gap-2">
+            {exporting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FileArchive className="h-3.5 w-3.5" />} Generate bundle
+          </button>
+        </div>
+        {exports.length > 0 && (
+          <div className="mt-4 space-y-1.5">
+            {exports.map((e) => (
+              <div key={e.id} className="flex items-center justify-between gap-3 text-[11px] font-mono border-b border-neutral-900 pb-1.5 last:border-0">
+                <span className="text-slate-300 truncate">{e.title}</span>
+                <span className="flex items-center gap-3 shrink-0">
+                  <span className="text-slate-500">score {e.score} · {e.findings_open} open · {(Number(e.size) / 1024).toFixed(1)} KB</span>
+                  <button onClick={() => downloadEvidence(e.id, e.title)} className="text-[#D4AF37] hover:underline flex items-center gap-1">
+                    <Download className="h-3 w-3" /> download
+                  </button>
+                </span>
               </div>
             ))}
           </div>

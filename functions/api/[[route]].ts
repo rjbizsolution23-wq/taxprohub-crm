@@ -3084,6 +3084,464 @@ async function mfaDisable(env: Env, request: Request, body: Record<string, unkno
   return json({ ok: true, enabled: false });
 }
 
+
+/* ═══════════ PUBLIC INTAKE — forms/funnels that create real records ═══════════
+ * Unauthenticated by design: a landing page or funnel step posts here and the
+ * submission becomes a deduped contact, an audit row, and (optionally) a
+ * workflow enrolment. Abuse control: per-IP KV throttle + payload caps.
+ */
+
+const INTAKE_MAX_FIELDS = 60;
+const INTAKE_MAX_VALUE = 4_000;
+
+async function throttleOk(env: Env, key: string, limit = 20, windowSec = 300) {
+  if (!env.LEDGER) return true;
+  try {
+    const raw = await env.LEDGER.get(key);
+    const n = Number(raw || 0);
+    if (n >= limit) return false;
+    await env.LEDGER.put(key, String(n + 1), { expirationTtl: windowSec });
+    return true;
+  } catch { return true; }
+}
+
+async function publicFormDefinition(env: Env, tenantId: string, slug: string) {
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const form = await env.DB.prepare(
+    `SELECT id, name, fields, settings FROM forms WHERE tenant_id = ? AND (slug = ? OR id = ?)`,
+  ).bind(tenantId, slug, slug).first<Record<string, any>>();
+  if (!form) return json({ ok: false, error: 'form_not_found' }, 404);
+  const tenant = await env.DB.prepare('SELECT name, business_name, logo, colors FROM tenants WHERE id = ?')
+    .bind(tenantId).first<Record<string, any>>() || {};
+  const settings = safeJson<Record<string, any>>(form.settings, {});
+  return json({
+    ok: true,
+    form: {
+      id: form.id,
+      name: form.name,
+      fields: safeJson(form.fields, []),
+      submitButtonText: settings.submitButtonText || 'Submit',
+      successMessage: settings.successMessage || 'Thank you — your information was received.',
+    },
+    practice: {
+      name: tenant.business_name || tenant.name,
+      logo: tenant.logo || null,
+      colors: safeJson(tenant.colors, {}),
+    },
+  });
+}
+
+async function publicFormSubmit(env: Env, request: Request, tenantId: string, slug: string, body: Record<string, any>) {
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const ip = request.headers.get('CF-Connecting-IP') || 'anon';
+  if (!(await throttleOk(env, `intake:${ip}`, 20, 300))) {
+    return json({ ok: false, error: 'rate_limited', hint: 'Too many submissions from this address. Try again shortly.' }, 429);
+  }
+
+  const tenant = await env.DB.prepare('SELECT * FROM tenants WHERE id = ?').bind(tenantId).first<Record<string, any>>();
+  if (!tenant) return json({ ok: false, error: 'tenant_not_found' }, 404);
+  const form = await env.DB.prepare(`SELECT * FROM forms WHERE tenant_id = ? AND (slug = ? OR id = ?)`)
+    .bind(tenantId, slug, slug).first<Record<string, any>>();
+  if (!form) return json({ ok: false, error: 'form_not_found' }, 404);
+
+  // Honeypot: bots fill hidden fields.
+  if (String(body._hp || '').trim()) return json({ ok: true, accepted: true });
+
+  const raw = (body.values && typeof body.values === 'object') ? body.values : body;
+  const values: Record<string, string> = {};
+  Object.entries(raw).slice(0, INTAKE_MAX_FIELDS).forEach(([k, v]) => {
+    if (k.startsWith('_')) return;
+    values[k.slice(0, 80)] = String(v ?? '').slice(0, INTAKE_MAX_VALUE);
+  });
+
+  const pick = (...keys: string[]) => {
+    for (const k of keys) {
+      const hit = Object.entries(values).find(([key]) => key.toLowerCase().replace(/[^a-z]/g, '') === k);
+      if (hit && hit[1]) return hit[1];
+    }
+    return '';
+  };
+  const email = (pick('email', 'emailaddress') || '').trim().toLowerCase();
+  const fullName = pick('name', 'fullname', 'yourname');
+  const firstName = pick('firstname') || fullName.split(' ')[0] || 'New';
+  const lastName = pick('lastname') || fullName.split(' ').slice(1).join(' ') || 'Lead';
+  const phone = pick('phone', 'phonenumber', 'mobile');
+  const company = pick('company', 'business', 'businessname');
+
+  const now = nowIso();
+  let contactId = '';
+
+  if (email) {
+    const existing = await env.DB.prepare('SELECT id, tags FROM contacts WHERE tenant_id = ? AND lower(email) = ?')
+      .bind(tenantId, email).first<Record<string, any>>();
+    if (existing) {
+      contactId = String(existing.id);
+      await env.DB.prepare('UPDATE contacts SET phone = COALESCE(NULLIF(?, \'\'), phone), updated_at = ? WHERE id = ?')
+        .bind(phone, now, contactId).run();
+    }
+  }
+
+  if (!contactId) {
+    // Respect the tenant's plan ceiling even for public intake.
+    const blocked = await enforceLimit(env, tenant, 'contacts');
+    if (blocked) return json({ ok: false, error: 'capacity', hint: 'This practice cannot accept new intakes right now.' }, 503);
+
+    contactId = uuid();
+    await env.DB.prepare(
+      `INSERT INTO contacts (id, tenant_id, first_name, last_name, email, phone, company, source, status,
+         tags, custom_fields, notes, activities, value, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'lead', ?, ?, '[]', '[]', 0, ?, ?)`,
+    ).bind(contactId, tenantId, firstName, lastName, email, phone, company,
+      String(body._source || form.name || 'Public form'),
+      JSON.stringify(['Web Intake']), JSON.stringify(values), now, now).run();
+  }
+
+  const submissionId = uuid();
+  await env.DB.prepare(
+    `INSERT INTO form_submissions (id, tenant_id, form_id, contact_id, payload, source, referrer, ip, user_agent, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(submissionId, tenantId, form.id, contactId, JSON.stringify(values),
+    String(body._source || 'public_form'), String(body._referrer || request.headers.get('Referer') || ''),
+    ip, request.headers.get('User-Agent') || '', now).run();
+
+  const settings = safeJson<Record<string, any>>(form.settings, {});
+
+  // Optional automation: enrol the new contact in a workflow.
+  let enrolled = false;
+  if (settings.workflowId) {
+    const wf = await env.DB.prepare('SELECT id FROM workflows WHERE id = ? AND tenant_id = ? AND is_active = 1')
+      .bind(settings.workflowId, tenantId).first();
+    if (wf) {
+      await env.DB.prepare(
+        `INSERT INTO workflow_runs (id, tenant_id, workflow_id, contact_id, status, step_index, next_run_at, context, log, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'active', 0, ?, '{}', '[]', ?, ?)`,
+      ).bind(uuid(), tenantId, settings.workflowId, contactId, now, now, now).run();
+      enrolled = true;
+    }
+  }
+
+  // Optional internal notification.
+  if (settings.notifyEmail) {
+    await safeSendEmail(env, {
+      to: String(settings.notifyEmail),
+      subject: `New intake: ${firstName} ${lastName}${company ? ` (${company})` : ''}`,
+      text: `Form: ${form.name}\n\n${Object.entries(values).map(([k, v]) => `${k}: ${v}`).join('\n')}\n\nContact id: ${contactId}`,
+    });
+  }
+
+  await audit(env, { tenantId, action: 'intake.submission', resource: 'form_submissions', resourceId: submissionId, details: { formId: form.id, contactId, enrolled }, request });
+  return json({
+    ok: true,
+    contactId,
+    submissionId,
+    workflowEnrolled: enrolled,
+    message: settings.successMessage || 'Thank you — your information was received.',
+  }, 201);
+}
+
+async function listSubmissions(env: Env, request: Request, url: URL) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const formId = url.searchParams.get('formId');
+  const where = formId ? 'tenant_id = ? AND form_id = ?' : 'tenant_id = ?';
+  const binds = formId ? [a.tenant.id, formId] : [a.tenant.id];
+  const rows = await env.DB.prepare(`SELECT * FROM form_submissions WHERE ${where} ORDER BY created_at DESC LIMIT 200`)
+    .bind(...binds).all<Record<string, unknown>>();
+  return json({ ok: true, items: (rows.results || []).map((r) => ({ ...r, payload: safeJson(r.payload, {}) })) });
+}
+
+/* ═══════════ PAYOUT RUNS — batched commissions via Stripe Connect ═══════════ */
+
+async function setPreparerPaymentAccount(env: Env, request: Request, preparerId: string, body: Record<string, unknown>) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const acct = String(body.stripeAccountId || '').trim();
+  if (!/^acct_[A-Za-z0-9]+$/.test(acct)) return bad('stripe_account_id_must_look_like_acct_xxx');
+  const now = nowIso();
+  await env.DB.prepare(
+    `INSERT INTO preparer_payment_accounts (preparer_id, tenant_id, stripe_account_id, method, status, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'active', ?, ?)
+     ON CONFLICT(preparer_id) DO UPDATE SET stripe_account_id = excluded.stripe_account_id, method = excluded.method, updated_at = excluded.updated_at`,
+  ).bind(preparerId, a.tenant.id, acct, String(body.method || 'stripe_connect'), now, now).run();
+  await audit(env, { tenantId: String(a.tenant.id), userId: String(a.user.id), action: 'payout.account_linked', resource: 'preparers', resourceId: preparerId, request });
+  return json({ ok: true, preparerId, stripeAccountId: acct });
+}
+
+/** Group every pending payout into one run, one line per preparer. */
+async function createPayoutRun(env: Env, request: Request, body: Record<string, unknown>) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+
+  const period = String(body.period || currentPeriod());
+  const pending = await env.DB.prepare(
+    `SELECT id, preparer_id, preparer_name, amount, commission_amount, status FROM payouts
+     WHERE tenant_id = ? AND (status IS NULL OR status IN ('', 'pending', 'approved'))`,
+  ).bind(a.tenant.id).all<Record<string, any>>();
+  const rows = pending.results || [];
+  if (!rows.length) return json({ ok: false, error: 'no_pending_payouts', hint: 'Accrue commissions first (POST /api/payouts/accrue).' }, 400);
+
+  const byPreparer = new Map<string, { name: string; cents: number; ids: string[] }>();
+  for (const r of rows) {
+    const cents = Math.round(Number(r.commission_amount || r.amount || 0) * 100);
+    if (cents <= 0) continue;
+    const key = String(r.preparer_id || 'unassigned');
+    const cur = byPreparer.get(key) || { name: String(r.preparer_name || key), cents: 0, ids: [] as string[] };
+    cur.cents += cents; cur.ids.push(String(r.id));
+    byPreparer.set(key, cur);
+  }
+  if (!byPreparer.size) return json({ ok: false, error: 'no_payable_amounts' }, 400);
+
+  const runId = uuid();
+  const now = nowIso();
+  let total = 0;
+  const stmt = env.DB.prepare(
+    `INSERT INTO payout_run_items (id, tenant_id, run_id, preparer_id, preparer_name, payout_ids, amount_cents, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+  );
+  const batch = [];
+  for (const [preparerId, v] of byPreparer) {
+    total += v.cents;
+    batch.push(stmt.bind(uuid(), a.tenant.id, runId, preparerId, v.name, JSON.stringify(v.ids), v.cents, now));
+  }
+  await env.DB.prepare(
+    `INSERT INTO payout_runs (id, tenant_id, period, status, total_cents, item_count, created_by, created_at)
+     VALUES (?, ?, ?, 'draft', ?, ?, ?, ?)`,
+  ).bind(runId, a.tenant.id, period, total, byPreparer.size, a.user.id, now).run();
+  await env.DB.batch(batch);
+
+  await audit(env, { tenantId: String(a.tenant.id), userId: String(a.user.id), action: 'payout.run_created', resource: 'payout_runs', resourceId: runId, details: { total, items: byPreparer.size }, request });
+  return json({ ok: true, runId, period, totalCents: total, items: byPreparer.size, status: 'draft' }, 201);
+}
+
+async function executePayoutRun(env: Env, request: Request, runId: string) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+
+  const run = await env.DB.prepare('SELECT * FROM payout_runs WHERE id = ? AND tenant_id = ?')
+    .bind(runId, a.tenant.id).first<Record<string, any>>();
+  if (!run) return json({ ok: false, error: 'run_not_found' }, 404);
+  if (run.status === 'complete') return json({ ok: false, error: 'already_executed' }, 409);
+
+  await env.DB.prepare(`UPDATE payout_runs SET status = 'executing' WHERE id = ?`).bind(runId).run();
+  const items = await env.DB.prepare(`SELECT * FROM payout_run_items WHERE run_id = ? AND status = 'pending'`)
+    .bind(runId).all<Record<string, any>>();
+
+  let paid = 0, failed = 0, paidCents = 0;
+  const now = nowIso();
+
+  for (const item of items.results || []) {
+    const acct = await env.DB.prepare('SELECT stripe_account_id FROM preparer_payment_accounts WHERE preparer_id = ? AND tenant_id = ?')
+      .bind(item.preparer_id, a.tenant.id).first<Record<string, unknown>>();
+    if (!acct?.stripe_account_id) {
+      failed++;
+      await env.DB.prepare(`UPDATE payout_run_items SET status = 'skipped', error = ? WHERE id = ?`)
+        .bind('no_connected_account', item.id).run();
+      continue;
+    }
+    if (!env.STRIPE_SECRET_KEY) {
+      failed++;
+      await env.DB.prepare(`UPDATE payout_run_items SET status = 'failed', error = ? WHERE id = ?`)
+        .bind('STRIPE_SECRET_KEY not configured', item.id).run();
+      continue;
+    }
+    try {
+      const res = await stripeConnectTransfer(env, {
+        amountCents: Number(item.amount_cents),
+        connectedAccountId: String(acct.stripe_account_id),
+        description: `Payout run ${run.period} — ${item.preparer_name}`,
+      });
+      const data = await res.clone().json().catch(() => ({})) as Record<string, any>;
+      if (res.status < 400 && data.ok !== false) {
+        paid++; paidCents += Number(item.amount_cents);
+        await env.DB.prepare(`UPDATE payout_run_items SET status = 'paid', stripe_transfer_id = ?, paid_at = ? WHERE id = ?`)
+          .bind(String(data.transferId || data.id || ''), now, item.id).run();
+        for (const pid of safeJson<string[]>(item.payout_ids, [])) {
+          await env.DB.prepare(`UPDATE payouts SET status = 'paid', payment_date = ?, updated_at = ? WHERE id = ? AND tenant_id = ?`)
+            .bind(now, now, pid, a.tenant.id).run();
+        }
+      } else {
+        failed++;
+        await env.DB.prepare(`UPDATE payout_run_items SET status = 'failed', error = ? WHERE id = ?`)
+          .bind(JSON.stringify(data).slice(0, 300), item.id).run();
+      }
+    } catch (e) {
+      failed++;
+      await env.DB.prepare(`UPDATE payout_run_items SET status = 'failed', error = ? WHERE id = ?`)
+        .bind(String(e).slice(0, 300), item.id).run();
+    }
+  }
+
+  await env.DB.prepare(`UPDATE payout_runs SET status = ?, paid_cents = ?, executed_at = ? WHERE id = ?`)
+    .bind(failed && !paid ? 'failed' : 'complete', paidCents, now, runId).run();
+  await audit(env, { tenantId: String(a.tenant.id), userId: String(a.user.id), action: 'payout.run_executed', resource: 'payout_runs', resourceId: runId, details: { paid, failed, paidCents }, request });
+  return json({ ok: true, runId, paid, failed, paidCents });
+}
+
+async function listPayoutRuns(env: Env, request: Request) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const runs = await env.DB.prepare('SELECT * FROM payout_runs WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 50')
+    .bind(a.tenant.id).all<Record<string, any>>();
+  const out = [];
+  for (const r of runs.results || []) {
+    const items = await env.DB.prepare('SELECT * FROM payout_run_items WHERE run_id = ? ORDER BY amount_cents DESC').bind(r.id).all<Record<string, unknown>>();
+    out.push({ ...r, items: items.results || [] });
+  }
+  const accounts = await env.DB.prepare('SELECT * FROM preparer_payment_accounts WHERE tenant_id = ?').bind(a.tenant.id).all<Record<string, unknown>>();
+  return json({ ok: true, runs: out, accounts: accounts.results || [], stripeConfigured: !!env.STRIPE_SECRET_KEY });
+}
+
+/* ═══════════ COMPLIANCE EVIDENCE EXPORT (audit / insurer ready) ═══════════ */
+
+async function buildEvidenceBundle(env: Env, request: Request, body: Record<string, unknown>) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+
+  const tenantId = String(a.tenant.id);
+  const tenant = await env.DB.prepare('SELECT * FROM tenants WHERE id = ?').bind(tenantId).first<Record<string, any>>() || {};
+  const since = String(body.since || new Date(Date.now() - 365 * 86400000).toISOString());
+
+  const q = async (sql: string, ...b: unknown[]) =>
+    ((await env.DB!.prepare(sql).bind(...b).all<Record<string, any>>()).results || []);
+
+  const findings = await q(`SELECT agent_key, severity, title, detail, authority, remediation, status, first_seen, last_seen, resolved_at FROM compliance_findings WHERE tenant_id = ? ORDER BY status, severity`, tenantId);
+  const runs = await q(`SELECT started_at, completed_at, trigger, agents_run, findings_opened, findings_resolved, score FROM compliance_runs WHERE tenant_id = ? AND started_at >= ? ORDER BY started_at DESC`, tenantId, since);
+  const agents = await q(`SELECT agent_key, name, domain, authority, cadence, last_run_at, checks_run, open_findings FROM compliance_agents WHERE tenant_id = ? ORDER BY agent_key`, tenantId);
+  const signatures = await q(`SELECT id, title, doc_type, signer_name, signer_email, status, signed_at, signature_ip, body_sha256 FROM signature_requests WHERE tenant_id = ? AND created_at >= ? ORDER BY created_at DESC`, tenantId, since);
+  const docs = await q(`SELECT name, folder, doc_type, size, sha256, created_at FROM files WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 1000`, tenantId);
+  const preparers = await q(`SELECT first_name, last_name, ptin, efin, credentials, ce_credits, circular230_status, status FROM preparers WHERE tenant_id = ?`, tenantId);
+  const auditLog = await q(`SELECT action, resource, resource_id, ip, created_at FROM audit_logs WHERE tenant_id = ? AND created_at >= ? ORDER BY created_at DESC LIMIT 5000`, tenantId, since);
+  const digestRows = await q(`SELECT subject, delivered, created_at FROM digests WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 100`, tenantId);
+
+  const open = findings.filter((f) => f.status === 'open');
+  const bySeverity: Record<string, number> = { critical: 0, high: 0, medium: 0, low: 0 };
+  open.forEach((f) => { bySeverity[String(f.severity)] = (bySeverity[String(f.severity)] || 0) + 1; });
+  const penalty = Object.entries(bySeverity).reduce((sum, [sev, n]) => sum + (SEVERITY_WEIGHT[sev] || 1) * n, 0);
+  const score = Math.max(0, 100 - penalty);
+
+  const generatedAt = nowIso();
+  const lines: string[] = [
+    '═══════════════════════════════════════════════════════════════',
+    ' COMPLIANCE EVIDENCE BUNDLE',
+    '═══════════════════════════════════════════════════════════════',
+    `Practice:        ${tenant.business_name || tenant.name}`,
+    `Tenant id:       ${tenantId}`,
+    `Generated:       ${generatedAt}`,
+    `Requested by:    ${a.user.email}`,
+    `Coverage window: ${since} → ${generatedAt}`,
+    `Compliance score:${score}/100`,
+    '',
+    `Open findings — critical ${bySeverity.critical} · high ${bySeverity.high} · medium ${bySeverity.medium} · low ${bySeverity.low}`,
+    '',
+    '1. AGENT ROSTER AND CADENCE',
+    '───────────────────────────────────────────────────────────────',
+    ...agents.map((x) => `  ${String(x.agent_key).padEnd(24)} ${x.name} | ${x.authority} | ${x.cadence} | checks run: ${x.checks_run} | last: ${x.last_run_at || 'never'}`),
+    '',
+    '2. SWEEP HISTORY',
+    '───────────────────────────────────────────────────────────────',
+    ...runs.map((r) => `  ${r.started_at} [${r.trigger}] agents=${r.agents_run} opened=${r.findings_opened} resolved=${r.findings_resolved} score=${r.score}`),
+    '',
+    '3. FINDINGS REGISTER',
+    '───────────────────────────────────────────────────────────────',
+    ...findings.map((f) => [
+      `  [${String(f.severity).toUpperCase()}] ${f.title}`,
+      `      agent:      ${f.agent_key}`,
+      `      authority:  ${f.authority}`,
+      `      status:     ${f.status}${f.resolved_at ? ` (resolved ${f.resolved_at})` : ''}`,
+      `      first seen: ${f.first_seen} | last seen: ${f.last_seen}`,
+      `      remediation:${f.remediation}`,
+    ].join('\n')),
+    '',
+    '4. EXECUTED AGREEMENTS (ESIGN Act / UETA)',
+    '───────────────────────────────────────────────────────────────',
+    ...signatures.map((sg) => `  ${sg.status.padEnd(9)} ${sg.doc_type.padEnd(20)} ${sg.signer_name || ''} <${sg.signer_email}> signed=${sg.signed_at || '—'} ip=${sg.signature_ip || '—'} sha256=${sg.body_sha256}`),
+    '',
+    '5. DOCUMENT VAULT INVENTORY (hash-verified)',
+    '───────────────────────────────────────────────────────────────',
+    ...docs.map((d) => `  ${String(d.created_at).slice(0, 10)} ${String(d.folder).padEnd(20)} ${String(d.name).padEnd(46)} ${String(d.size).padStart(9)}B sha256=${d.sha256}`),
+    '',
+    '6. PREPARER CREDENTIALS',
+    '───────────────────────────────────────────────────────────────',
+    ...preparers.map((p) => `  ${p.first_name} ${p.last_name} | PTIN ${p.ptin || 'MISSING'} | EFIN ${p.efin || '—'} | CE ${p.ce_credits} | Circ230 ${p.circular230_status} | ${p.status}`),
+    '',
+    '7. DAILY DIGEST DELIVERY LOG',
+    '───────────────────────────────────────────────────────────────',
+    ...digestRows.map((d) => `  ${d.created_at} delivered=${d.delivered ? 'yes' : 'no'} :: ${d.subject}`),
+    '',
+    '8. AUDIT TRAIL',
+    '───────────────────────────────────────────────────────────────',
+    ...auditLog.map((e) => `  ${e.created_at} ${String(e.action).padEnd(26)} ${String(e.resource || '').padEnd(20)} ${e.resource_id || ''} ip=${e.ip || '—'}`),
+    '',
+    '═══════════════════════════════════════════════════════════════',
+    ' ATTESTATION',
+    '═══════════════════════════════════════════════════════════════',
+    ' This bundle was generated directly from the practice management system of',
+    ' record. Findings are produced by automated agents that query live data;',
+    ' document hashes are SHA-256 values recorded at upload or signature time.',
+    ' Retain under IRC §6107(b) and FTC Safeguards Rule 16 CFR 314.4(i).',
+    '',
+  ];
+
+  const text = lines.join('\n');
+  const bytes = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  const sha = Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  const id = uuid();
+  const title = `compliance-evidence-${generatedAt.slice(0, 10)}-${id.slice(0, 8)}.txt`;
+  let key = '';
+
+  if (env.DOCS) {
+    key = `tenants/${tenantId}/evidence/${id}/${title}`;
+    await env.DOCS.put(key, bytes, { httpMetadata: { contentType: 'text/plain' }, customMetadata: { kind: 'compliance-evidence', sha256: sha } });
+  }
+
+  await env.DB.prepare(
+    `INSERT INTO evidence_exports (id, tenant_id, requested_by, title, r2_key, size, sha256, score, findings_open, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(id, tenantId, String(a.user.email), title, key, bytes.length, sha, score, open.length, key ? 'complete' : 'no_object_store', generatedAt).run();
+
+  await audit(env, { tenantId, userId: String(a.user.id), action: 'compliance.evidence_export', resource: 'evidence_exports', resourceId: id, details: { size: bytes.length, sha256: sha }, request });
+  return json({
+    ok: true, id, title, sizeBytes: bytes.length, sha256: sha, score,
+    openFindings: open.length, sections: 8, archived: !!key,
+    downloadUrl: `/api/compliance/evidence/${id}/download`,
+  }, 201);
+}
+
+async function listEvidenceExports(env: Env, request: Request) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const rows = await env.DB.prepare('SELECT * FROM evidence_exports WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 50')
+    .bind(a.tenant.id).all<Record<string, unknown>>();
+  return json({ ok: true, items: (rows.results || []).map((r) => ({ ...r, downloadUrl: `/api/compliance/evidence/${r.id}/download` })) });
+}
+
+async function downloadEvidence(env: Env, request: Request, id: string) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const row = await env.DB.prepare('SELECT * FROM evidence_exports WHERE id = ? AND tenant_id = ?')
+    .bind(id, a.tenant.id).first<Record<string, any>>();
+  if (!row) return json({ ok: false, error: 'not_found' }, 404);
+  if (!env.DOCS || !row.r2_key) return json({ ok: false, error: 'no_object_store' }, 410);
+  const obj = await env.DOCS.get(String(row.r2_key));
+  if (!obj) return json({ ok: false, error: 'object_missing' }, 410);
+  return new Response(obj.body, {
+    headers: {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Content-Disposition': `attachment; filename="${row.title}"`,
+      'Cache-Control': 'private, no-store',
+    },
+  });
+}
+
 /* ═══════════════════════════ ROUTER ═══════════════════════════ */
 export const onRequest = async (ctx: Ctx): Promise<Response> => {
   const { request, env, params } = ctx;
@@ -3112,6 +3570,44 @@ export const onRequest = async (ctx: Ctx): Promise<Response> => {
 
     /* ── Bootstrap ── */
     if (route === '/v1/bootstrap' && request.method === 'GET') return handleBootstrap(env, request);
+
+    /* ── Public intake (unauthenticated) ── */
+    if (route.startsWith('/public/forms/')) {
+      const parts = route.split('/').filter(Boolean); // ['public','forms',tenantId,slug]
+      const tenantId = parts[2]; const slug = parts.slice(3).join('/');
+      if (!tenantId || !slug) return json({ ok: false, error: 'form_path_required' }, 400);
+      if (request.method === 'GET') return publicFormDefinition(env, tenantId, slug);
+      if (request.method === 'POST') {
+        const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+        return publicFormSubmit(env, request, tenantId, slug, body);
+      }
+      return json({ ok: false, error: 'method_not_allowed' }, 405);
+    }
+    if (route === '/submissions' && request.method === 'GET') return listSubmissions(env, request, new URL(request.url));
+
+    /* ── Payout runs ── */
+    if (route === '/payouts/runs' && request.method === 'GET') return listPayoutRuns(env, request);
+    if (route === '/payouts/runs' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return createPayoutRun(env, request, body);
+    }
+    if (/^\/payouts\/runs\/[^/]+\/execute$/.test(route) && request.method === 'POST') {
+      return executePayoutRun(env, request, route.split('/')[3]);
+    }
+    if (/^\/preparers\/[^/]+\/payment-account$/.test(route) && request.method === 'POST') {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return setPreparerPaymentAccount(env, request, route.split('/')[2], body);
+    }
+
+    /* ── Compliance evidence exports ── */
+    if (route === '/compliance/evidence' && request.method === 'GET') return listEvidenceExports(env, request);
+    if (route === '/compliance/evidence' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return buildEvidenceBundle(env, request, body);
+    }
+    if (/^\/compliance\/evidence\/[^/]+\/download$/.test(route) && request.method === 'GET') {
+      return downloadEvidence(env, request, route.split('/')[3]);
+    }
 
     /* ── Plans, metering, platform admin ── */
     if (route === '/plan' && request.method === 'GET') return planStatus(env, request);

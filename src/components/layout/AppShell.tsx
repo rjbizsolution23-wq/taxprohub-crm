@@ -60,6 +60,7 @@ const navSections: Array<{ title: string; items: NavItem[] }> = [
     items: [
       { name: 'Tax Clients', href: '/tax?tab=clients', icon: Users, badgeKey: 'contacts', color: 'text-amber-500' },
       { name: 'Invoicing', href: '/billing', icon: FileText, badge: '$ due', badgeColor: 'text-emerald-400', color: 'text-emerald-400' },
+      { name: 'Payout Runs', href: '/payout-runs', icon: DollarSign, badge: 'Stripe Connect', badgeColor: 'text-emerald-400', color: 'text-emerald-400' },
       { name: 'Preparers & Payouts', href: '/preparers', icon: Users, badgeKey: 'preparers', color: 'text-[#D4AF37]' },
       { name: 'Document Intelligence', href: '/documents', icon: ScanLine, badge: 'OCR ✦ no-key', badgeColor: 'text-emerald-400', color: 'text-amber-400' },
       { name: 'Documents', href: '/tax?tab=documents', icon: Folder, color: 'text-blue-400' },

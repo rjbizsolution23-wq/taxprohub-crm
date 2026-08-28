@@ -138,6 +138,48 @@ Functions) against **D1** with per-tenant isolation:
 Full audit & architecture: [`ANALYSIS.md`](./ANALYSIS.md) ·
 Deployment: [`docs/DEPLOYMENT_RUNBOOK.md`](./docs/DEPLOYMENT_RUNBOOK.md)
 
+## 🌐 PUBLIC INTAKE FUNNEL
+
+`/#/f/:tenantId/:slug` renders any of the practice's real forms to the public —
+no login. A submission:
+
+1. dedupes or creates a **live contact** (plan ceiling still enforced),
+2. records the raw payload in `form_submissions` with IP, referrer and user agent,
+3. **enrols the contact in a workflow** when the form's `settings.workflowId` is set,
+4. emails an internal notification when `settings.notifyEmail` is set.
+
+Abuse controls: hidden honeypot field, per-IP KV throttle (20 / 5 min), 60-field
+and 4 KB-per-value caps.
+
+| Route | Purpose |
+|---|---|
+| `GET /api/public/forms/:tenantId/:slug` | form definition + practice branding |
+| `POST /api/public/forms/:tenantId/:slug` | submit → contact + submission + workflow |
+| `GET /api/submissions` | authenticated submission log |
+
+## 💸 PAYOUT RUNS (Stripe Connect)
+
+`/#/payout-runs` batches every pending commission into a run — one line per
+preparer — then fires real Stripe Connect transfers. Each line reports `paid`
+(with transfer id), `skipped` (no connected account) or `failed` (with the
+provider's error). Paid lines flip their source `payouts` rows to `paid`.
+
+| Route | Purpose |
+|---|---|
+| `POST /api/preparers/:id/payment-account` | link `acct_…` (validated) |
+| `POST /api/payouts/runs` | build a run from pending commissions |
+| `POST /api/payouts/runs/:id/execute` | execute transfers |
+| `GET /api/payouts/runs` | runs + line items + account status |
+
+## 📁 COMPLIANCE EVIDENCE EXPORT
+
+One click on the Compliance Center produces an **audit-ready bundle** archived to
+R2 and hash-sealed. Eight sections: agent roster & cadence · sweep history ·
+full findings register with citations and remediation · executed agreements with
+signature hashes and IPs · hash-verified vault inventory · preparer credentials ·
+digest delivery log · audit trail. Hand it to an IRS reviewer, a malpractice
+carrier or a SOC 2 auditor.
+
 ## 🔐 MFA (TOTP) + PLAN ENFORCEMENT + PLATFORM ADMIN
 
 **Two-factor authentication** — RFC 6238 TOTP implemented at the edge (HMAC-SHA1

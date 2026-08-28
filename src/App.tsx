@@ -16,6 +16,8 @@ import ClientPortalPage from './pages/ClientPortalPage';
 import CompliancePage from './pages/CompliancePage';
 import SignPage from './pages/SignPage';
 import SecurityPage from './pages/SecurityPage';
+import PublicFormPage from './pages/PublicFormPage';
+import PayoutRunsPage from './pages/PayoutRunsPage';
 
 // Main Pages
 import DashboardPage from './pages/DashboardPage';
@@ -106,6 +108,7 @@ function App() {
         {/* Passwordless client portal — public, tenant-scoped by magic link */}
         <Route path="/portal" element={<ClientPortalPage />} />
         <Route path="/sign" element={<SignPage />} />
+        <Route path="/f/:tenantId/:slug" element={<PublicFormPage />} />
 
         <Route path="/signup-company" element={<div className="min-h-screen bg-slate-950"><OnboardPage /></div>} />
 
@@ -216,6 +219,7 @@ function App() {
           {/* Enterprise Ecosystem Portal (40 Premium Modules) */}
           <Route path="/compliance" element={<CompliancePage />} />
           <Route path="/security" element={<SecurityPage />} />
+          <Route path="/payout-runs" element={<PayoutRunsPage />} />
           <Route path="/ecosystem" element={<EcosystemPage />} />
           
           {/* Administration & Customizer Settings */}
