@@ -13,7 +13,11 @@
     "db:migrate": "for f in migrations/*.sql; do npx wrangler d1 execute taxprohub-crm --remote --file \"$f\"; done",
     "deploy": "npm run build && npx wrangler pages deploy dist --project-name tax-pro-hub-university",
     "ship": "node scripts/ship.mjs",
-    "db:migrate:local": "for f in migrations/*.sql; do npx wrangler d1 execute taxprohub-crm --local --file \"$f\"; done"
+    "db:migrate:local": "for f in migrations/*.sql; do npx wrangler d1 execute taxprohub-crm --local --file \"$f\"; done",
+    "test": "vitest run",
+    "test:unit": "vitest run",
+    "test:api": "node scripts/api-smoke.mjs",
+    "test:all": "npm run typecheck && npm run test:unit && npm run test:api"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
@@ -40,6 +44,7 @@
     "tailwindcss": "4.1.17",
     "typescript": "5.9.3",
     "vite": "7.3.2",
-    "vite-plugin-singlefile": "2.3.0"
+    "vite-plugin-singlefile": "2.3.0",
+    "vitest": "^3.2.7"
   }
 }

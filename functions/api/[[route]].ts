@@ -383,7 +383,7 @@ async function handleSignup(env: Env, request: Request, body: Record<string, unk
   const businessName = String(body.businessName || body.businessName || 'Tax Pro Hub Practice').trim();
   const phone = String(body.phone || '').trim();
   const password = String(body.password || '');
-  const plan = String(body.plan || 'growth');
+  const plan = String(body.plan || 'starter');
 
   if (!emailOk(email)) return bad('A valid email address is required.');
   if (name.length < 2) return bad('Please enter your full name.');
@@ -3542,6 +3542,221 @@ async function downloadEvidence(env: Env, request: Request, id: string) {
   });
 }
 
+
+/* ═══════════ WHITE-LABEL SUB-ACCOUNTS & CUSTOM DOMAINS ═══════════
+ * A sub-account is a real tenant row plus a hierarchy edge, so every existing
+ * tenant-scoped query, plan ceiling and compliance sweep applies to it too.
+ * Domains resolve branded public surfaces (portal, intake forms, signing) by
+ * Host header — no per-tenant deploy required.
+ */
+
+async function childTenantIds(env: Env, parentId: string): Promise<string[]> {
+  if (!env.DB) return [];
+  const rows = await env.DB.prepare(`SELECT tenant_id FROM tenant_hierarchy WHERE parent_tenant_id = ? AND status = 'active'`)
+    .bind(parentId).all<Record<string, unknown>>();
+  return (rows.results || []).map((r) => String(r.tenant_id));
+}
+
+async function createSubAccount(env: Env, request: Request, body: Record<string, any>) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+
+  const parentRow = await env.DB.prepare('SELECT * FROM tenants WHERE id = ?').bind(a.tenant.id).first<Record<string, any>>();
+  const plan = planFor(parentRow);
+  const existing = await childTenantIds(env, String(a.tenant.id));
+  if (existing.length + 1 >= plan.subAccounts + 1) {
+    // +1 because the parent itself occupies one slot in the plan's allowance.
+    if (existing.length >= plan.subAccounts) {
+      return json({
+        ok: false, error: 'plan_limit_reached', metric: 'subAccounts', plan: plan.key,
+        limit: plan.subAccounts, used: existing.length,
+        hint: `${plan.label} allows ${plan.subAccounts} white-label sub-account${plan.subAccounts === 1 ? '' : 's'}.`,
+        upgradeTo: plan.key === 'starter' ? 'professional' : 'enterprise',
+      }, 402);
+    }
+  }
+
+  const name = String(body.name || '').trim();
+  if (name.length < 2) return bad('sub_account_name_required');
+  const email = String(body.email || '').trim().toLowerCase();
+
+  const tenantId = `t_${randHex(6)}`;
+  const now = nowIso();
+  await env.DB.prepare(
+    `INSERT INTO tenants (id, name, business_name, business_address, email, phone, logo, domain, colors, status, plan, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+  ).bind(tenantId, name, String(body.businessName || name), String(body.businessAddress || ''), email,
+    String(body.phone || ''), String(body.logo || ''), String(body.domain || ''),
+    JSON.stringify(body.colors || safeJson(parentRow?.colors, {})), String(body.plan || parentRow?.plan || 'starter'), now, now).run();
+
+  await env.DB.prepare(
+    `INSERT INTO tenant_hierarchy (tenant_id, parent_tenant_id, label, revenue_share_pct, status, created_by, created_at)
+     VALUES (?, ?, ?, ?, 'active', ?, ?)`,
+  ).bind(tenantId, a.tenant.id, String(body.label || name), Number(body.revenueSharePct || 0), a.user.id, now).run();
+
+  // Seed the default pipeline so the child practice is usable immediately.
+  await env.DB.prepare(
+    `INSERT INTO pipelines (id, tenant_id, name, stages, color, is_default, created_at, updated_at)
+     VALUES (?, ?, 'Sales Pipeline', ?, '#D4AF37', 1, ?, ?)`,
+  ).bind(uuid(), tenantId, JSON.stringify([
+    { id: 'stage-1', name: 'New Lead', position: 0 }, { id: 'stage-2', name: 'Contacted', position: 1 },
+    { id: 'stage-3', name: 'Qualified', position: 2 }, { id: 'stage-4', name: 'Proposal', position: 3 },
+    { id: 'stage-5', name: 'Negotiation', position: 4 }, { id: 'stage-6', name: 'Closed Won', position: 5 },
+    { id: 'stage-7', name: 'Closed Lost', position: 6 },
+  ]), now, now).run();
+
+  // Optional owner login for the sub-account.
+  let ownerUserId = '';
+  if (email && body.ownerPassword) {
+    const dupe = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first();
+    if (dupe) return json({ ok: false, error: 'owner_email_taken' }, 409);
+    ownerUserId = `u_${randHex(6)}`;
+    await env.DB.prepare(
+      `INSERT INTO users (id, tenant_id, email, name, role, status, password_hash, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'admin', 'active', ?, ?, ?)`,
+    ).bind(ownerUserId, tenantId, email, String(body.ownerName || name),
+      await hashPassword(String(body.ownerPassword), env.SESSION_SECRET), now, now).run();
+  }
+
+  await ensureComplianceRoster(env, tenantId);
+  await audit(env, { tenantId: String(a.tenant.id), userId: String(a.user.id), action: 'whitelabel.subaccount_created', resource: 'tenants', resourceId: tenantId, details: { name }, request });
+  return json({ ok: true, tenantId, name, ownerUserId: ownerUserId || null, complianceAgents: COMPLIANCE_AGENTS.length }, 201);
+}
+
+async function listSubAccounts(env: Env, request: Request) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+
+  const parentRow = await env.DB.prepare('SELECT * FROM tenants WHERE id = ?').bind(a.tenant.id).first<Record<string, any>>();
+  const plan = planFor(parentRow);
+  const ids = await childTenantIds(env, String(a.tenant.id));
+  const items = [];
+  for (const id of ids) {
+    const t = await env.DB.prepare('SELECT * FROM tenants WHERE id = ?').bind(id).first<Record<string, any>>();
+    if (!t) continue;
+    const edge = await env.DB.prepare('SELECT * FROM tenant_hierarchy WHERE tenant_id = ?').bind(id).first<Record<string, any>>();
+    const usage = await getUsage(env, id);
+    const findings = await env.DB.prepare(`SELECT COUNT(*) AS n FROM compliance_findings WHERE tenant_id = ? AND status = 'open'`)
+      .bind(id).first<Record<string, unknown>>();
+    const domains = await env.DB.prepare('SELECT hostname, kind, status, is_primary FROM tenant_domains WHERE tenant_id = ?')
+      .bind(id).all<Record<string, unknown>>();
+    items.push({
+      id, name: t.name, businessName: t.business_name, plan: t.plan, status: t.status,
+      revenueSharePct: Number(edge?.revenue_share_pct || 0), createdAt: t.created_at,
+      usage, openFindings: Number(findings?.n || 0), domains: domains.results || [],
+    });
+  }
+  return json({ ok: true, items, limit: plan.subAccounts, used: items.length, plan: plan.key });
+}
+
+/* ── Custom domains ── */
+
+async function addTenantDomain(env: Env, request: Request, body: Record<string, any>) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+
+  const hostname = String(body.hostname || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  if (!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(hostname)) return bad('valid_hostname_required');
+
+  // A tenant may only claim a domain for itself or one of its own children.
+  const tenantId = String(body.tenantId || a.tenant.id);
+  if (tenantId !== String(a.tenant.id)) {
+    const children = await childTenantIds(env, String(a.tenant.id));
+    if (!children.includes(tenantId)) return json({ ok: false, error: 'forbidden_not_your_subaccount' }, 403);
+  }
+
+  const taken = await env.DB.prepare('SELECT tenant_id FROM tenant_domains WHERE hostname = ?').bind(hostname).first<Record<string, unknown>>();
+  if (taken && String(taken.tenant_id) !== tenantId) return json({ ok: false, error: 'hostname_already_claimed' }, 409);
+
+  const token = `tph-verify=${randHex(16)}`;
+  const id = uuid();
+  const now = nowIso();
+  await env.DB.prepare(
+    `INSERT INTO tenant_domains (id, tenant_id, hostname, kind, status, verify_token, is_primary, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+     ON CONFLICT(hostname) DO UPDATE SET kind = excluded.kind, verify_token = excluded.verify_token, updated_at = excluded.updated_at`,
+  ).bind(id, tenantId, hostname, String(body.kind || 'portal'), token, body.isPrimary ? 1 : 0, now, now).run();
+
+  await audit(env, { tenantId, userId: String(a.user.id), action: 'domain.claimed', resource: 'tenant_domains', resourceId: hostname, request });
+  return json({
+    ok: true, hostname, status: 'pending', verifyToken: token,
+    dns: [
+      { type: 'TXT', name: `_tph-verify.${hostname}`, value: token, purpose: 'Proves you control the domain' },
+      { type: 'CNAME', name: hostname, value: 'tax-pro-hub-university.pages.dev', purpose: 'Routes traffic to the platform' },
+    ],
+    next: 'Add both records, then POST /api/domains/verify. Also add the hostname as a Custom Domain on the Pages project.',
+  }, 201);
+}
+
+async function verifyTenantDomain(env: Env, request: Request, body: Record<string, any>) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const hostname = String(body.hostname || '').trim().toLowerCase();
+  const row = await env.DB.prepare('SELECT * FROM tenant_domains WHERE hostname = ?').bind(hostname).first<Record<string, any>>();
+  if (!row) return json({ ok: false, error: 'domain_not_claimed' }, 404);
+
+  const children = await childTenantIds(env, String(a.tenant.id));
+  if (String(row.tenant_id) !== String(a.tenant.id) && !children.includes(String(row.tenant_id))) {
+    return json({ ok: false, error: 'forbidden' }, 403);
+  }
+
+  // DNS-over-HTTPS lookup of the verification TXT record.
+  let verified = false; let observed: string[] = [];
+  try {
+    const res = await fetch(`https://cloudflare-dns.com/dns-query?name=_tph-verify.${hostname}&type=TXT`, {
+      headers: { accept: 'application/dns-json' },
+    });
+    const dns = await res.json() as any;
+    observed = (dns.Answer || []).map((x: any) => String(x.data || '').replace(/"/g, ''));
+    verified = observed.some((v) => v === String(row.verify_token));
+  } catch (e) {
+    return json({ ok: false, error: 'dns_lookup_failed', detail: String(e).slice(0, 160) }, 502);
+  }
+
+  const now = nowIso();
+  await env.DB.prepare('UPDATE tenant_domains SET status = ?, verified_at = ?, updated_at = ? WHERE hostname = ?')
+    .bind(verified ? 'active' : 'failed', verified ? now : null, now, hostname).run();
+  await audit(env, { tenantId: String(row.tenant_id), userId: String(a.user.id), action: verified ? 'domain.verified' : 'domain.verify_failed', resource: 'tenant_domains', resourceId: hostname, request });
+  return json({ ok: verified, hostname, status: verified ? 'active' : 'failed', observed, expected: row.verify_token });
+}
+
+async function listTenantDomains(env: Env, request: Request) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const ids = [String(a.tenant.id), ...(await childTenantIds(env, String(a.tenant.id)))];
+  const rows = await env.DB.prepare(
+    `SELECT * FROM tenant_domains WHERE tenant_id IN (${ids.map(() => '?').join(',')}) ORDER BY created_at DESC`,
+  ).bind(...ids).all<Record<string, unknown>>();
+  return json({ ok: true, items: rows.results || [] });
+}
+
+/**
+ * Public branding resolver — a white-labelled portal/form host asks
+ * "who am I?" before rendering. Unauthenticated by design.
+ */
+async function resolveBranding(env: Env, request: Request, url: URL) {
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const hostname = (url.searchParams.get('host') || request.headers.get('Host') || '').toLowerCase().split(':')[0];
+  const domain = await env.DB.prepare(`SELECT * FROM tenant_domains WHERE hostname = ? AND status = 'active'`)
+    .bind(hostname).first<Record<string, any>>();
+  if (!domain) return json({ ok: true, matched: false, hostname, note: 'No active white-label domain for this host — platform branding applies.' });
+  const t = await env.DB.prepare('SELECT id, name, business_name, logo, colors, email, phone FROM tenants WHERE id = ?')
+    .bind(domain.tenant_id).first<Record<string, any>>();
+  if (!t) return json({ ok: true, matched: false, hostname });
+  return json({
+    ok: true, matched: true, hostname, kind: domain.kind,
+    tenant: {
+      id: t.id, name: t.name, businessName: t.business_name, logo: t.logo,
+      colors: safeJson(t.colors, {}), email: t.email, phone: t.phone,
+    },
+  });
+}
+
 /* ═══════════════════════════ ROUTER ═══════════════════════════ */
 export const onRequest = async (ctx: Ctx): Promise<Response> => {
   const { request, env, params } = ctx;
@@ -3570,6 +3785,23 @@ export const onRequest = async (ctx: Ctx): Promise<Response> => {
 
     /* ── Bootstrap ── */
     if (route === '/v1/bootstrap' && request.method === 'GET') return handleBootstrap(env, request);
+
+    /* ── White-label sub-accounts & domains ── */
+    if (route === '/subaccounts' && request.method === 'GET') return listSubAccounts(env, request);
+    if (route === '/subaccounts' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return createSubAccount(env, request, body);
+    }
+    if (route === '/domains' && request.method === 'GET') return listTenantDomains(env, request);
+    if (route === '/domains' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return addTenantDomain(env, request, body);
+    }
+    if (route === '/domains/verify' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return verifyTenantDomain(env, request, body);
+    }
+    if (route === '/branding' && request.method === 'GET') return resolveBranding(env, request, new URL(request.url));
 
     /* ── Public intake (unauthenticated) ── */
     if (route.startsWith('/public/forms/')) {

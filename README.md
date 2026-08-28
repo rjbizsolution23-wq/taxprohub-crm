@@ -138,6 +138,44 @@ Functions) against **D1** with per-tenant isolation:
 Full audit & architecture: [`ANALYSIS.md`](./ANALYSIS.md) ·
 Deployment: [`docs/DEPLOYMENT_RUNBOOK.md`](./docs/DEPLOYMENT_RUNBOOK.md)
 
+## 🧪 TEST SUITE (CI-gated)
+
+```bash
+npm run test:unit   # 11 vitest units — parser, filing, sync diff, formatting
+npm run test:api    # 81 assertions against a REAL edge stack
+npm run test:all    # typecheck + both
+```
+
+`scripts/api-smoke.mjs` builds the app, applies all 8 migrations to a scratch
+local D1, boots `wrangler pages dev` with D1 + KV + R2 bound, then drives the
+HTTP API exactly like a browser — auth, tenant isolation, vault upload/download,
+campaign queues, workflow execution, e-signature ceremony + replay protection,
+invoicing, all 24 compliance agents, evidence bundle hashing, portal
+anti-enumeration, public intake + honeypot, payout runs, plan metering, TOTP
+(generated with an independent implementation), SSE streaming, and white-label
+domain claims. **Non-zero exit on any failure — the GitHub Actions job gates
+every deploy on it.**
+
+## 🏷️ WHITE-LABEL STUDIO
+
+`/#/white-label` provisions **child practices as real isolated tenants** — own
+D1 rows, own default pipeline, own plan ceiling, own 24-agent compliance roster,
+own document vault — with a configurable revenue share. Plan caps are enforced
+(Starter 1 · Professional 3 · Enterprise 50; exceeding returns HTTP 402).
+
+Custom domains are claimed per tenant with a verification token, then verified
+by a **live DNS-over-HTTPS TXT lookup**. `GET /api/branding?host=…` lets any
+white-labelled surface resolve its practice branding at runtime, so portals,
+intake forms and signing pages render under the client firm's name and colours
+with no extra deploy.
+
+| Route | Purpose |
+|---|---|
+| `GET|POST /api/subaccounts` | list / provision child practices |
+| `GET|POST /api/domains` | list / claim a hostname (returns TXT + CNAME) |
+| `POST /api/domains/verify` | live DNS verification |
+| `GET /api/branding?host=` | public branding resolver |
+
 ## 🌐 PUBLIC INTAKE FUNNEL
 
 `/#/f/:tenantId/:slug` renders any of the practice's real forms to the public —

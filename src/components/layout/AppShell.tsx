@@ -123,6 +123,7 @@ const navSections: Array<{ title: string; items: NavItem[] }> = [
   {
     title: 'ADMIN',
     items: [
+      { name: 'White-Label Studio', href: '/white-label', icon: Building2, badge: 'domains', badgeColor: 'text-cyan-400', color: 'text-cyan-400' },
       { name: 'Tenant Studio', href: '/tenant-studio', icon: Crown, badge: 'master admin', badgeColor: 'text-amber-400', color: 'text-amber-400' },
       { name: 'Company Onboarding', href: '/onboard', icon: Rocket, badge: 'self-serve', badgeColor: 'text-emerald-400', color: 'text-emerald-400' },
       { name: 'Sub-Accounts', href: '/admin', icon: Building2, badgeKey: 'subAccounts', color: 'text-blue-400' },
