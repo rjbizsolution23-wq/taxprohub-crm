@@ -1,34 +1,43 @@
 # ═══════════════════════════════════════════════════════════════
-# CLOUDFLARE PAGES — RJ Business Solutions TAX PRO HUB UNIVERSITY
+# CLOUDFLARE PAGES — Tax Pro Hub University
+# Deploy: pnpm build && wrangler pages deploy dist --project-name tax-pro-hub-university
 # ═══════════════════════════════════════════════════════════════
-# Deploy:
-#   npm run build
-#   npx wrangler pages deploy dist --project-name tax-pro-hub-university
-#
-# The functions/ directory ships automatically with Pages —
-# every /api/* route runs as a Cloudflare Worker at the edge.
-#
-# Secrets (set once per environment):
-#   npx wrangler pages secret put TWILIO_ACCOUNT_SID
-#   npx wrangler pages secret put TWILIO_AUTH_TOKEN
-#   npx wrangler pages secret put TWILIO_FROM_NUMBER
-#   npx wrangler pages secret put STRIPE_SECRET_KEY
-#   npx wrangler pages secret put STRIPE_WEBHOOK_SECRET
-#   npx wrangler pages secret put CF_CALLS_APP_ID        # Cloudflare Calls (video)
-#   npx wrangler pages secret put CF_CALLS_APP_SECRET
-#   npx wrangler pages secret put OPENAI_API_KEY         # any OpenAI-compatible provider
-#   npx wrangler pages secret put OPENAI_BASE_URL
-#   npx wrangler pages secret put RESEND_API_KEY         # optional; MailChannels fallback is free
-#   npx wrangler pages secret put MAIL_FROM
-#
-# Durable ledger (payouts, referrals, stripe events):
-#   npx wrangler kv namespace create LEDGER
-#   → paste the returned id below and uncomment the binding.
 
 name = "tax-pro-hub-university"
 compatibility_date = "2026-08-01"
 pages_build_output_dir = "dist"
 
+# ── KV Namespaces ────────────────────────────────────────────
 [[kv_namespaces]]
 binding = "LEDGER"
 id = "efc2da2c19934e68a956a84bfe76f7a2"
+
+# ── Observability ────────────────────────────────────────────
+[observability]
+enabled = true
+
+[observability.logs]
+head_sampling_rate = 1
+
+# ── Secrets (set via wrangler pages secret put NAME) ─────────
+# TWILIO_ACCOUNT_SID      Twilio Account SID
+# TWILIO_AUTH_TOKEN       Twilio Auth Token
+# TWILIO_FROM_NUMBER      Twilio From Number (+1xxxxxxxxxx)
+# STRIPE_SECRET_KEY       Stripe Secret Key (sk_live_...)
+# STRIPE_WEBHOOK_SECRET   Stripe Webhook Signing Secret (whsec_...)
+# STRIPE_PRICE_STARTER    Stripe Price ID for Starter plan
+# STRIPE_PRICE_GROWTH     Stripe Price ID for Growth plan
+# STRIPE_PRICE_ENTERPRISE Stripe Price ID for Enterprise plan
+# CF_CALLS_APP_ID         Cloudflare Calls App ID
+# CF_CALLS_APP_SECRET     Cloudflare Calls App Secret
+# OPENAI_API_KEY          OpenAI or compatible API key
+# OPENAI_BASE_URL         Optional custom base URL (OpenRouter, CF AI, etc)
+# OPENAI_MODEL            Optional model override (gpt-4o-mini, etc)
+# RESEND_API_KEY          Resend API key for transactional email
+# MAIL_FROM               From address (no-reply@yourdomain.com)
+# SUPABASE_URL            Supabase project URL (https://xxx.supabase.co)
+# SUPABASE_SERVICE_ROLE_KEY Supabase service role key (for auth proxy)
+# GHL_API_KEY             GoHighLevel API key (pit-xxxxx)
+# GHL_LOCATION_ID         GoHighLevel location/sub-account ID
+# GHL_PIPELINE_ID         GHL Pipeline ID for new leads
+# GHL_STAGE_ID            GHL Stage ID for new leads

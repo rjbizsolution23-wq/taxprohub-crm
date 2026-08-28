@@ -1,10 +1,7 @@
 /**
- * 📱 RJ BUSINESS SOLUTIONS — LIVE TWILIO SMS INTEGRATION
- * Client-Side Twilio REST API Dispatcher
- * 
- * Securely transmits outbound SMS messages utilizing account SIDs and auth tokens.
+ * SMS Dispatcher — routes through Cloudflare Pages Function /api/sms/send
+ * All Twilio credentials stay server-side; browser never sees auth tokens.
  */
-
 import { getAppConfig } from './config';
 
 export interface SMSTransactionMetadata {
@@ -15,84 +12,40 @@ export interface SMSTransactionMetadata {
 }
 
 /**
- * Sends an SMS message to a mobile number via the Twilio REST API.
- * Uses client-side direct request with Basic Authentication.
- * 
- * @param to Phone number of the recipient (e.g. +14144304277)
- * @param body Message content
+ * Sends an SMS via the server-side /api/sms/send endpoint.
+ * Falls back to a console warning in dev if the API isn't reachable.
  */
 export async function sendSMSViaTwilio(to: string, body: string): Promise<SMSTransactionMetadata> {
   const startTime = performance.now();
-  const config = getAppConfig();
-  
-  const accountSid = config.twilioAccountSid;
-  const authToken = config.twilioAuthToken;
-  const fromNumber = config.twilioPhoneNumber;
 
-  if (!accountSid || !authToken || !fromNumber) {
-    const elapsed = Math.round(performance.now() - startTime);
-    return {
-      success: false,
-      error: 'Missing Twilio configuration credentials. Verify your keys in settings.',
-      latencyMs: elapsed
-    };
-  }
-
-  // Format recipient number (strip non-digits, ensure +1 prefix if US)
+  // Format recipient number
   let formattedTo = to.replace(/[^\d+]/g, '');
   if (!formattedTo.startsWith('+')) {
-    if (formattedTo.length === 10) {
-      formattedTo = '+1' + formattedTo;
-    } else {
-      formattedTo = '+' + formattedTo;
-    }
+    formattedTo = formattedTo.length === 10 ? '+1' + formattedTo : '+' + formattedTo;
   }
 
   try {
-    const url = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`;
-    const basicAuth = btoa(`${accountSid}:${authToken}`);
-
-    const params = new URLSearchParams();
-    params.append('To', formattedTo);
-    params.append('From', fromNumber);
-    params.append('Body', body);
-
-    const response = await fetch(url, {
+    const res = await fetch('/api/sms/send', {
       method: 'POST',
-      headers: {
-        'Authorization': `Basic ${basicAuth}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: params.toString(),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: formattedTo, body }),
     });
 
     const elapsed = Math.round(performance.now() - startTime);
+    const data = await res.json() as { ok: boolean; sid?: string; error?: string; configured?: boolean };
 
-    if (!response.ok) {
-      const errText = await response.text();
-      let parsedError = 'Twilio Gateway Rejection';
-      try {
-        const errJson = JSON.parse(errText);
-        parsedError = errJson.message || errJson.code || errText;
-      } catch {
-        parsedError = errText;
+    if (!res.ok || !data.ok) {
+      if (data.configured === false) {
+        console.warn('[SMS] Twilio not configured on server. Set TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_FROM_NUMBER secrets.');
+        return { success: false, error: 'Twilio credentials not configured on server. Contact admin.', latencyMs: elapsed };
       }
-      throw new Error(parsedError);
+      return { success: false, error: data.error || 'SMS send failed', latencyMs: elapsed };
     }
 
-    const data = await response.json();
-    return {
-      success: true,
-      sid: data.sid,
-      latencyMs: elapsed
-    };
-  } catch (error: any) {
-    console.warn('Twilio live SMS dispatch failed:', error);
+    return { success: true, sid: data.sid, latencyMs: elapsed };
+  } catch (err: any) {
     const elapsed = Math.round(performance.now() - startTime);
-    return {
-      success: false,
-      error: error.message || String(error),
-      latencyMs: elapsed
-    };
+    console.warn('[SMS] Network error reaching /api/sms/send:', err);
+    return { success: false, error: err.message || 'Network error', latencyMs: elapsed };
   }
 }
