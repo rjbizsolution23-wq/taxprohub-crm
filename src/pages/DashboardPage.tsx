@@ -2,6 +2,7 @@ import { useSearchParams, useNavigate } from 'react-router-dom';
 import { useState, useEffect, useMemo } from 'react';
 import { useAppStore } from '../store';
 import { apiHealthDetail } from '../utils/api';
+import { listTasks, createTask, updateTask, type LiveTask } from '../utils/engine';
 import { 
   Users, DollarSign, Calendar, TrendingUp, Mail, Phone, Clock, 
   CheckCircle, Shield, Award, Sparkles, ArrowUpRight, AlertTriangle,
@@ -22,8 +23,27 @@ export default function DashboardPage() {
   const { contacts, currentSubAccount, deals, pipelines, appointments, subAccounts, allDeals } = useAppStore();
 
   // Tasks States
-  // LIVE task queue — starts empty; tasks are created by the user or by AI parsing.
+  // LIVE task queue — persisted in D1 (`tasks` table); workflow actions write
+  // into the same table, so automations and humans share one work queue.
   const [tasksList, setTasksList] = useState<any[]>([]);
+  const [tasksBacked, setTasksBacked] = useState(false);
+
+  const refreshTasks = async () => {
+    const res = await listTasks();
+    if (!res.ok) { setTasksBacked(false); return; }
+    setTasksBacked(true);
+    setTasksList(res.items.map((t: LiveTask) => ({
+      ...t,
+      client: t.contactId || '—',
+      due: t.dueAt ? new Date(t.dueAt).toLocaleString() : '',
+      sla: t.dueAt ? `${Math.max(0, Math.round((new Date(t.dueAt).getTime() - Date.now()) / 3600000))}h remaining` : '',
+      subtasks: 0,
+      comments: 0,
+      tags: t.tags || [],
+    })));
+  };
+
+  useEffect(() => { void refreshTasks(); }, []);
   const [taskView, setTaskView] = useState<'list' | 'kanban' | 'calendar' | 'client' | 'project'>('kanban');
   const [newTaskInput, setNewTaskInput] = useState('');
   const [aiGenerating, setAiGenerating] = useState(false);
@@ -84,37 +104,39 @@ export default function DashboardPage() {
   // Manual re-poll of the live edge health endpoint.
   const triggerSystemPulse = () => { void refreshSystemHealth(); };
 
-  // AI Task Auto-creator simulation
-  const handleAiTaskCreation = (e: React.FormEvent) => {
+  // AI Task Auto-creator — parses the prompt, then PERSISTS to D1.
+  const handleAiTaskCreation = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newTaskInput.trim()) return;
 
     setAiGenerating(true);
-    setTimeout(() => {
+    {
       const parsedPriority = newTaskInput.toLowerCase().includes('urgent') ? 'urgent' : 
                              newTaskInput.toLowerCase().includes('high') ? 'high' : 'medium';
       
       const parsedTags = newTaskInput.toLowerCase().includes('audit') ? ['Audit Shield'] :
                          newTaskInput.toLowerCase().includes('w2') || newTaskInput.toLowerCase().includes('organizer') ? ['Tax Prep'] : ['AI Spark'];
 
-      const addedTask = {
-        id: Date.now(),
+      const dueAt = new Date(Date.now() + 86400000).toISOString();
+      const draft = {
         title: newTaskInput,
-        client: 'AI Extracted Lead',
-        assignee: 'Rick Jefferson',
-        priority: parsedPriority,
-        due: 'Tomorrow, 5:00 PM',
+        priority: parsedPriority as LiveTask['priority'],
         status: 'To-Do' as const,
-        sla: '24h remaining',
+        dueAt,
         tags: parsedTags,
-        subtasks: 1,
-        comments: 0
+        source: 'ai',
       };
 
-      setTasksList([addedTask, ...tasksList]);
+      const res = await createTask(draft);
+      if (res.ok) {
+        await refreshTasks();
+      } else {
+        // Backend not provisioned — keep the task locally so the queue still works.
+        setTasksList([{ id: `local-${Date.now()}`, ...draft, client: '—', due: new Date(dueAt).toLocaleString(), sla: '24h remaining', subtasks: 0, comments: 0 }, ...tasksList]);
+      }
       setNewTaskInput('');
       setAiGenerating(false);
-    }, 1000);
+    }
   };
 
   /* ═══════ LIVE PRACTICE METRICS — derived from real CRM records ═══════ */
@@ -199,8 +221,11 @@ export default function DashboardPage() {
     [appointments]
   );
 
-  const handleToggleTaskStatus = (taskId: number, newStatus: string) => {
+  const handleToggleTaskStatus = (taskId: any, newStatus: string) => {
     setTasksList(prev => prev.map(t => t.id === taskId ? { ...t, status: newStatus } : t));
+    if (tasksBacked && !String(taskId).startsWith('local-')) {
+      void updateTask(String(taskId), { status: newStatus as LiveTask['status'] });
+    }
   };
 
   return (
@@ -868,7 +893,7 @@ function BotIcon({ className }: { className?: string }) {
 }
 
 // Sub-component: Individual Task Card
-function TaskCard({ task, onMove }: { task: any, onMove: (id: number, status: string) => void }) {
+function TaskCard({ task, onMove }: { task: any, onMove: (id: any, status: string) => void }) {
   return (
     <div className="bg-neutral-900/80 border border-[#D4AF37]/10 rounded-2xl p-4 hover:border-[#D4AF37]/25 transition-all shadow-md group relative">
       <div className="flex justify-between items-start mb-2">

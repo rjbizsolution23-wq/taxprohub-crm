@@ -12,6 +12,7 @@ import LandingPage from './pages/LandingPage';
 import LoginPage from './pages/auth/LoginPage';
 import SignupPage from './pages/auth/SignupPage';
 import ForgotPasswordPage from './pages/auth/ForgotPasswordPage';
+import ClientPortalPage from './pages/ClientPortalPage';
 
 // Main Pages
 import DashboardPage from './pages/DashboardPage';
@@ -99,6 +100,9 @@ function App() {
         </Route>
 
         {/* Public self-serve signup — tax companies can onboard without logging in */}
+        {/* Passwordless client portal — public, tenant-scoped by magic link */}
+        <Route path="/portal" element={<ClientPortalPage />} />
+
         <Route path="/signup-company" element={<div className="min-h-screen bg-slate-950"><OnboardPage /></div>} />
 
         {/* Protected Admin & Practice Owner Routes - Full AppShell */}

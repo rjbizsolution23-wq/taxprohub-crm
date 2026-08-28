@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
+import { scheduleCampaign } from '../utils/engine';
 import { useAppStore } from '../store';
 import {
   Plus, Mail, MessageSquare, Send, BarChart3, Clock, CheckCircle, PauseCircle,
@@ -132,6 +133,23 @@ export default function CampaignsPage() {
   const view = (searchParams.get('view') as 'active' | 'library') || (campaigns.length === 0 ? 'library' : 'active');
   const [filter, setFilter] = useState('all');
   const [catFilter, setCatFilter] = useState<string>('all');
+
+  const [sendState, setSendState] = useState<Record<string, string>>({});
+
+  /** Queue a real send through the edge engine (D1 → cron tick → provider). */
+  const dispatchCampaign = async (e: React.MouseEvent, id: string) => {
+    e.stopPropagation();
+    setSendState((p) => ({ ...p, [id]: 'sending' }));
+    const res = await scheduleCampaign(id);
+    const data: any = res.data || {};
+    setSendState((p) => ({
+      ...p,
+      [id]: res.ok
+        ? `queued ${data.recipients ?? ''} recipient${data.recipients === 1 ? '' : 's'}`
+        : (data.hint || data.error || 'backend not configured'),
+    }));
+  };
+
 
   const installedTemplateIds = useMemo(() => new Set(campaigns.map(c => c.sourceTemplateId).filter(Boolean)), [campaigns]);
   const filteredCampaigns = filter === 'all' ? campaigns : campaigns.filter((c) => c.status === filter);
@@ -317,7 +335,18 @@ export default function CampaignsPage() {
                         </div>
                       </div>
                     </div>
-                    <div className="text-left md:text-right text-xs text-slate-400 font-mono self-end md:self-center">
+                    <div className="text-left md:text-right text-xs text-slate-400 font-mono self-end md:self-center space-y-2">
+                      <button
+                        onClick={(e) => dispatchCampaign(e, campaign.id)}
+                        disabled={sendState[campaign.id] === 'sending'}
+                        className="px-3 py-1.5 rounded-xl bg-gradient-to-r from-amber-600 to-yellow-500 text-black text-[10px] font-black uppercase tracking-wider disabled:opacity-50"
+                        title="Materialize recipients in D1 and deliver on the next engine tick"
+                      >
+                        {sendState[campaign.id] === 'sending' ? 'Queueing…' : 'Send now'}
+                      </button>
+                      {sendState[campaign.id] && sendState[campaign.id] !== 'sending' && (
+                        <p className="text-[10px] text-amber-400 max-w-[220px] truncate">{sendState[campaign.id]}</p>
+                      )}
                       <p>Created: {new Date(campaign.createdAt).toLocaleDateString('en-US', { dateStyle: 'medium' })}</p>
                       {campaign.audience && <p className="text-slate-500 max-w-[240px] truncate">{campaign.audience}</p>}
                     </div>

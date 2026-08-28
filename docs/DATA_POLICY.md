@@ -66,3 +66,12 @@ Uploaded originals are **real objects in Cloudflare R2**, indexed in D1
 (`migrations/0002_files.sql`). The Document Intelligence page shows the live
 vault contents; when the bucket isn't provisioned it displays the
 `not_configured` hint from `/api/health` rather than a fake file list.
+
+## 6. Delivery engine + portal (live queues)
+
+`campaign_recipients`, `workflow_runs` and `tasks` are **real D1 queues**. The
+dashboard task board reads and writes `/api/v1/tasks`, so a workflow's
+`create_task` action and a human-created task land in the same list. Campaign
+"Send now" materializes recipients and reports the true queued count; if no
+email/SMS provider is configured the recipients are marked `failed` with the
+provider error rather than displaying a fake "sent" number.

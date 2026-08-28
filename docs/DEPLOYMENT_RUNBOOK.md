@@ -207,6 +207,39 @@ Local D1 persists in `.wrangler/state`. To reset local data:
 
 ---
 
+## 3b. Delivery engine cron (required for campaigns + workflows)
+
+Pages Functions cannot own a Cron Trigger, so deploy the companion Worker:
+
+```bash
+# 1. shared secret on BOTH sides
+openssl rand -hex 32                       # copy the value
+npx wrangler pages secret put CRON_SECRET --project-name tax-pro-hub-university
+
+cd workers/cron
+npx wrangler deploy                        # creates taxprohub-cron, runs every minute
+npx wrangler secret put CRON_SECRET        # paste the same value
+```
+
+Verify: `curl -X POST https://tax-pro-hub-university.pages.dev/api/cron/tick -H "X-Cron-Secret: <secret>"`
+→ `{"ok":true,"campaignsSent":0,"workflowsAdvanced":0,...}`
+
+## 3c. Client portal
+
+Set `PORTAL_BASE_URL` to the public origin so magic links point at the right host:
+
+```bash
+npx wrangler pages secret put PORTAL_BASE_URL --project-name tax-pro-hub-university
+# e.g. https://app.taxprohubuniversity.com
+```
+
+Magic-link delivery uses the same email provider as campaigns — configure
+`RESEND_API_KEY` + `MAIL_FROM` (MailChannels is the free fallback) or clients
+will never receive their link.
+
+
+---
+
 ## Appendix: GitHub Actions workflow (`.github/workflows/deploy.yml`)
 
 > This file exists in the working tree but **cannot be pushed by the Arena GitHub App**

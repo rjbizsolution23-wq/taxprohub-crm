@@ -1,0 +1,13 @@
+name = "taxprohub-cron"
+main = "index.mjs"
+compatibility_date = "2026-08-01"
+
+# Every minute — the tick is idempotent and batches 50 jobs per run.
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+APP_URL = "https://tax-pro-hub-university.pages.dev"
+
+# Secret (not stored here):
+#   npx wrangler secret put CRON_SECRET

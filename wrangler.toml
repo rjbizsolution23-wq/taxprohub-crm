@@ -22,6 +22,8 @@
 #   npx wrangler pages secret put RESEND_API_KEY         # optional; MailChannels fallback is free
 #   npx wrangler pages secret put MAIL_FROM
 #   npx wrangler pages secret put SESSION_SECRET         # optional pepper for password hashes
+#   npx wrangler pages secret put CRON_SECRET            # shared with workers/cron
+#   npx wrangler pages secret put PORTAL_BASE_URL        # e.g. https://app.taxprohubuniversity.com
 
 name = "tax-pro-hub-university"
 compatibility_date = "2026-08-01"

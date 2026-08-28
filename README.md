@@ -138,6 +138,44 @@ Functions) against **D1** with per-tenant isolation:
 Full audit & architecture: [`ANALYSIS.md`](./ANALYSIS.md) ·
 Deployment: [`docs/DEPLOYMENT_RUNBOOK.md`](./docs/DEPLOYMENT_RUNBOOK.md)
 
+## ⚙️ DELIVERY ENGINE (campaigns + workflows, durable at the edge)
+
+Campaigns and automations are **real queued jobs in D1**, not simulations:
+
+| Route | Purpose |
+|---|---|
+| `POST /api/campaigns/:id/send-now` | materializes one row per recipient/channel |
+| `POST /api/campaigns/:id/schedule` | same, with `sendAt` in the future |
+| `GET /api/campaigns/:id/stats` | live run + per-status recipient counts |
+| `POST /api/workflows/:id/enroll` | enrolls contacts; the run advances step-by-step |
+| `POST /api/cron/tick` | drains 50 jobs/tick (`X-Cron-Secret`) |
+
+Supported workflow actions: `send_email`, `send_sms`, `add_tag`, `create_task`,
+`delay` (durable — the run sleeps in D1), `webhook`. Merge tags
+(`{{contact.firstName}}`, `{{business.name}}`) are rendered server-side.
+
+Pages can't own a Cron Trigger, so `workers/cron/` is a 40-line companion
+Worker that pokes `/api/cron/tick` every minute:
+
+```bash
+cd workers/cron && npx wrangler deploy && npx wrangler secret put CRON_SECRET
+```
+
+## 🔐 CLIENT PORTAL (passwordless)
+
+`/#/portal` — clients enter their email, get a **single-use magic link**
+(30 min TTL → 12 h session), then see their engagements, appointments and
+documents, and can upload straight into the firm's R2 vault. Sessions are
+separate from staff sessions and are scoped to one contact record.
+
+| Route | Purpose |
+|---|---|
+| `POST /api/portal/request-link` | emails the link; never reveals whether the address exists |
+| `POST /api/portal/verify` | one-time token → 12 h portal session |
+| `GET /api/portal/me` | contact + practice + deals + appointments + documents |
+| `POST /api/portal/files` | client upload → R2, tagged to the contact |
+| `GET /api/portal/files/:id/download` | streams only that client's own files |
+
 ## 🗄️ SECURE DOCUMENT VAULT (Cloudflare R2)
 
 Originals dropped into **Document Intelligence** are OCR'd on-device and then

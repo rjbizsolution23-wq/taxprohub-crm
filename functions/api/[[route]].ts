@@ -59,6 +59,8 @@ interface Env {
   RESEND_API_KEY?: string;
   MAIL_FROM?: string;
   SESSION_SECRET?: string;
+  CRON_SECRET?: string;
+  PORTAL_BASE_URL?: string;
 }
 
 type Ctx = { request: Request; env: Env; params: { route?: string[] } };
@@ -301,6 +303,13 @@ const ENTITIES: Record<string, EntityDef> = {
     text: ['id', 'tenant_id', 'preparer_id', 'preparer_name', 'deal_id', 'deal_title', 'method', 'status', 'reference_number', 'payment_date', 'description', 'notes'],
     json: ['created_at', 'updated_at'],
     numeric: ['amount', 'base_amount', 'commission_amount'],
+    bool: [],
+  },
+  tasks: {
+    table: 'tasks',
+    text: ['id', 'tenant_id', 'title', 'description', 'contact_id', 'deal_id', 'assignee', 'priority', 'status', 'due_at', 'source'],
+    json: ['tags', 'created_at', 'updated_at'],
+    numeric: [],
     bool: [],
   },
   pipelines: {
@@ -765,6 +774,7 @@ function health(env: Env) {
       database_d1: !!env.DB,
       kv_ledger: !!env.LEDGER,
       r2_document_vault: !!env.DOCS,
+      cron_engine: !!env.CRON_SECRET,
       twilio_sms: !!(env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && env.TWILIO_FROM_NUMBER),
       stripe: !!env.STRIPE_SECRET_KEY,
       stripe_webhooks: !!env.STRIPE_WEBHOOK_SECRET,
@@ -929,6 +939,491 @@ async function deleteFile(env: Env, request: Request, id: string) {
   return json({ ok: true, deleted: id });
 }
 
+
+
+/** Engine-safe wrappers: provider/network failures become results, not crashes. */
+async function safeSendEmail(env: Env, payload: { to: string; subject: string; html?: string; text?: string }) {
+  try {
+    const res = await sendEmail(env, payload);
+    const body = await res.clone().json().catch(() => ({})) as Record<string, unknown>;
+    return { ok: res.status < 400 && body.ok !== false, status: res.status, body };
+  } catch (e) {
+    return { ok: false, status: 0, body: { error: String(e).slice(0, 200) } };
+  }
+}
+
+async function safeSendSMS(env: Env, to: string, body: string) {
+  try {
+    const res = await sendSMS(env, to, body);
+    const data = await res.clone().json().catch(() => ({})) as Record<string, unknown>;
+    return { ok: res.status < 400 && data.ok !== false, status: res.status, body: data };
+  } catch (e) {
+    return { ok: false, status: 0, body: { error: String(e).slice(0, 200) } };
+  }
+}
+
+/* ══════════ DELIVERY ENGINE — campaigns, workflows, cron worker ══════════ */
+
+/** {{contact.firstName}} style merge tags resolved against a contact row. */
+function renderTemplate(tpl: string, contact: Record<string, unknown> | null, tenant: Record<string, unknown>) {
+  const map: Record<string, string> = {
+    'contact.firstName': String(contact?.first_name || 'there'),
+    'contact.lastName': String(contact?.last_name || ''),
+    'contact.email': String(contact?.email || ''),
+    'contact.company': String(contact?.company || ''),
+    'business.name': String(tenant?.business_name || tenant?.name || ''),
+    'business.email': String(tenant?.email || ''),
+    'business.phone': String(tenant?.phone || ''),
+  };
+  return String(tpl || '').replace(/\{\{\s*([\w.]+)\s*\}\}/g, (_m, key) => map[key] ?? '');
+}
+
+/** Materialize a campaign into per-recipient rows so sends are resumable. */
+async function scheduleCampaign(env: Env, request: Request, campaignId: string, body: Record<string, unknown>) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+
+  const campaign = await env.DB.prepare('SELECT * FROM campaigns WHERE id = ? AND tenant_id = ?')
+    .bind(campaignId, a.tenant.id).first<Record<string, unknown>>();
+  if (!campaign) return json({ ok: false, error: 'campaign_not_found' }, 404);
+
+  const sendAt = String(body.sendAt || nowIso());
+  const explicitIds = Array.isArray(body.contactIds) ? body.contactIds.map(String) : null;
+  const tag = body.tag ? String(body.tag) : null;
+
+  let query = 'SELECT * FROM contacts WHERE tenant_id = ?';
+  const binds: unknown[] = [a.tenant.id];
+  if (explicitIds?.length) {
+    query += ` AND id IN (${explicitIds.map(() => '?').join(',')})`;
+    binds.push(...explicitIds);
+  }
+  if (tag) { query += ' AND tags LIKE ?'; binds.push(`%${tag}%`); }
+  const contacts = await env.DB.prepare(query).bind(...binds).all<Record<string, unknown>>();
+  const audience = contacts.results || [];
+  if (!audience.length) return json({ ok: false, error: 'empty_audience' }, 400);
+
+  const type = String(campaign.type || 'email');
+  const channels = type === 'both' ? ['email', 'sms'] : [type === 'sms' ? 'sms' : 'email'];
+
+  const runId = uuid();
+  const now = nowIso();
+  const rows: { id: string; channel: string; address: string; contactId: string }[] = [];
+  for (const c of audience) {
+    for (const channel of channels) {
+      const address = channel === 'email' ? String(c.email || '') : String(c.phone || '');
+      if (!address) continue;
+      rows.push({ id: uuid(), channel, address, contactId: String(c.id) });
+    }
+  }
+  if (!rows.length) return json({ ok: false, error: 'no_reachable_recipients' }, 400);
+
+  await env.DB.prepare(
+    `INSERT INTO campaign_runs (id, tenant_id, campaign_id, status, scheduled_at, total, sent, failed, created_by, created_at)
+     VALUES (?, ?, ?, 'scheduled', ?, ?, 0, 0, ?, ?)`,
+  ).bind(runId, a.tenant.id, campaignId, sendAt, rows.length, a.user.id, now).run();
+
+  const stmt = env.DB.prepare(
+    `INSERT INTO campaign_recipients (id, tenant_id, run_id, campaign_id, contact_id, channel, address, status, scheduled_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
+  );
+  await env.DB.batch(rows.map((r) => stmt.bind(r.id, a.tenant.id, runId, campaignId, r.contactId, r.channel, r.address, sendAt, now)));
+
+  await env.DB.prepare('UPDATE campaigns SET status = ?, scheduled_at = ?, recipient_count = ?, updated_at = ? WHERE id = ? AND tenant_id = ?')
+    .bind('scheduled', sendAt, rows.length, now, campaignId, a.tenant.id).run();
+
+  await audit(env, { tenantId: String(a.tenant.id), userId: String(a.user.id), action: 'campaign.schedule', resource: 'campaigns', resourceId: campaignId, details: { runId, recipients: rows.length, sendAt }, request });
+  return json({ ok: true, runId, recipients: rows.length, scheduledAt: sendAt, note: 'Queued. The cron tick delivers due recipients.' }, 201);
+}
+
+async function campaignStats(env: Env, request: Request, campaignId: string) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const runs = await env.DB.prepare('SELECT * FROM campaign_runs WHERE campaign_id = ? AND tenant_id = ? ORDER BY created_at DESC')
+    .bind(campaignId, a.tenant.id).all<Record<string, unknown>>();
+  const totals = await env.DB.prepare(
+    `SELECT status, COUNT(*) AS n FROM campaign_recipients WHERE campaign_id = ? AND tenant_id = ? GROUP BY status`,
+  ).bind(campaignId, a.tenant.id).all<Record<string, unknown>>();
+  const byStatus: Record<string, number> = {};
+  (totals.results || []).forEach((r) => { byStatus[String(r.status)] = Number(r.n); });
+  return json({ ok: true, runs: runs.results || [], byStatus });
+}
+
+/** Enroll a contact into a workflow — the cron tick advances it step by step. */
+async function enrollWorkflow(env: Env, request: Request, workflowId: string, body: Record<string, unknown>) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+
+  const wf = await env.DB.prepare('SELECT * FROM workflows WHERE id = ? AND tenant_id = ?')
+    .bind(workflowId, a.tenant.id).first<Record<string, unknown>>();
+  if (!wf) return json({ ok: false, error: 'workflow_not_found' }, 404);
+
+  const contactIds = Array.isArray(body.contactIds) ? body.contactIds.map(String)
+    : body.contactId ? [String(body.contactId)] : [];
+  if (!contactIds.length) return json({ ok: false, error: 'contact_required' }, 400);
+
+  const now = nowIso();
+  const stmt = env.DB.prepare(
+    `INSERT INTO workflow_runs (id, tenant_id, workflow_id, contact_id, status, step_index, next_run_at, context, log, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'active', 0, ?, '{}', '[]', ?, ?)`,
+  );
+  const ids = contactIds.map(() => uuid());
+  await env.DB.batch(contactIds.map((cid, i) => stmt.bind(ids[i], a.tenant.id, workflowId, cid, now, now, now)));
+  await audit(env, { tenantId: String(a.tenant.id), userId: String(a.user.id), action: 'workflow.enroll', resource: 'workflows', resourceId: workflowId, details: { contacts: contactIds.length }, request });
+  return json({ ok: true, enrolled: contactIds.length, runIds: ids }, 201);
+}
+
+/** Execute one workflow action. Returns a delay in minutes when it must wait. */
+async function runWorkflowAction(
+  env: Env,
+  action: Record<string, any>,
+  ctx: { tenantId: string; contact: Record<string, unknown> | null; tenant: Record<string, unknown> },
+): Promise<{ log: string; delayMinutes?: number }> {
+  const cfg = action.config || {};
+  const type = String(action.type || '');
+  const contact = ctx.contact;
+
+  switch (type) {
+    case 'delay':
+      return { log: `delay ${cfg.delayMinutes || 60}m`, delayMinutes: Number(cfg.delayMinutes || 60) };
+
+    case 'send_email': {
+      const to = String(contact?.email || '');
+      if (!to) return { log: 'send_email skipped — contact has no email' };
+      const res = await safeSendEmail(env, {
+        to,
+        subject: renderTemplate(String(cfg.subject || 'Update from your tax team'), contact, ctx.tenant),
+        text: renderTemplate(String(cfg.body || cfg.message || ''), contact, ctx.tenant),
+      });
+      return { log: `send_email → ${to} (${res.ok ? 'sent' : 'failed'})` };
+    }
+
+    case 'send_sms': {
+      const to = String(contact?.phone || '');
+      if (!to) return { log: 'send_sms skipped — contact has no phone' };
+      const res = await safeSendSMS(env, to, renderTemplate(String(cfg.message || ''), contact, ctx.tenant));
+      return { log: `send_sms → ${to} (${res.ok ? 'sent' : 'failed'})` };
+    }
+
+    case 'add_tag': {
+      if (!contact || !env.DB) return { log: 'add_tag skipped' };
+      const tags = safeJson<string[]>(contact.tags, []);
+      const tag = String(cfg.tag || '');
+      if (tag && !tags.includes(tag)) {
+        tags.push(tag);
+        await env.DB.prepare('UPDATE contacts SET tags = ?, updated_at = ? WHERE id = ? AND tenant_id = ?')
+          .bind(JSON.stringify(tags), nowIso(), contact.id, ctx.tenantId).run();
+      }
+      return { log: `add_tag ${tag}` };
+    }
+
+    case 'create_task': {
+      if (!env.DB) return { log: 'create_task skipped' };
+      await env.DB.prepare(
+        `INSERT INTO tasks (id, tenant_id, title, description, contact_id, priority, status, source, tags, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'To-Do', 'workflow', '[]', ?, ?)`,
+      ).bind(uuid(), ctx.tenantId, renderTemplate(String(cfg.taskName || cfg.title || 'Workflow task'), contact, ctx.tenant),
+        renderTemplate(String(cfg.description || ''), contact, ctx.tenant),
+        contact?.id || null, String(cfg.priority || 'medium'), nowIso(), nowIso()).run();
+      return { log: `create_task "${renderTemplate(String(cfg.taskName || cfg.title || 'Workflow task'), contact, ctx.tenant)}"` };
+    }
+
+    case 'webhook': {
+      const url = String(cfg.url || '');
+      if (!url) return { log: 'webhook skipped — no url' };
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contact, tenantId: ctx.tenantId, at: nowIso() }),
+        });
+        return { log: `webhook ${url} → ${res.status}` };
+      } catch (e) {
+        return { log: `webhook ${url} → error ${String(e).slice(0, 80)}` };
+      }
+    }
+
+    default:
+      return { log: `unsupported action "${type}" — skipped` };
+  }
+}
+
+/**
+ * CRON TICK — drains due campaign recipients and advances due workflow runs.
+ * Auth: `X-Cron-Secret: $CRON_SECRET` header, or an authenticated admin session.
+ * Wire it to a Cloudflare Cron Trigger / any scheduler hitting POST /api/cron/tick.
+ */
+async function cronTick(env: Env, request: Request) {
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+
+  const secret = request.headers.get('X-Cron-Secret') || '';
+  const authorized = (env.CRON_SECRET && secret === env.CRON_SECRET) || !!(await auth(env, request));
+  if (!authorized) return json({ ok: false, error: 'unauthenticated', hint: 'Send X-Cron-Secret or a bearer session' }, 401);
+
+  const now = nowIso();
+  const BATCH = 50;
+  const result = { campaignsSent: 0, campaignsFailed: 0, workflowsAdvanced: 0, workflowsCompleted: 0 };
+
+  /* ── campaigns ── */
+  const due = await env.DB.prepare(
+    `SELECT * FROM campaign_recipients WHERE status = 'queued' AND scheduled_at <= ? ORDER BY scheduled_at LIMIT ?`,
+  ).bind(now, BATCH).all<Record<string, unknown>>();
+
+  for (const r of due.results || []) {
+    const campaign = await env.DB.prepare('SELECT * FROM campaigns WHERE id = ?').bind(r.campaign_id).first<Record<string, unknown>>();
+    const tenant = await env.DB.prepare('SELECT * FROM tenants WHERE id = ?').bind(r.tenant_id).first<Record<string, unknown>>() || {};
+    const contact = r.contact_id
+      ? await env.DB.prepare('SELECT * FROM contacts WHERE id = ?').bind(r.contact_id).first<Record<string, unknown>>()
+      : null;
+
+    let ok = false; let error = ''; let providerId = '';
+    try {
+      if (!campaign) {
+        error = 'campaign_deleted';
+      } else if (r.channel === 'email') {
+        const res = await safeSendEmail(env, {
+          to: String(r.address),
+          subject: renderTemplate(String(campaign.subject || campaign.name || 'Update'), contact, tenant),
+          text: renderTemplate(String(campaign.content || ''), contact, tenant),
+        });
+        ok = res.ok; error = ok ? '' : JSON.stringify(res.body).slice(0, 300);
+      } else {
+        const res = await safeSendSMS(env, String(r.address), renderTemplate(String(campaign.content || ''), contact, tenant));
+        ok = res.ok; providerId = String(res.body?.sid || ''); error = ok ? '' : JSON.stringify(res.body).slice(0, 300);
+      }
+    } catch (e) {
+      ok = false; error = String(e).slice(0, 300);
+    }
+
+    await env.DB.prepare('UPDATE campaign_recipients SET status = ?, sent_at = ?, error = ?, provider_id = ? WHERE id = ?')
+      .bind(ok ? 'sent' : 'failed', now, error, providerId, r.id).run();
+    await env.DB.prepare(
+      `UPDATE campaign_runs SET status = 'sending', started_at = COALESCE(started_at, ?), sent = sent + ?, failed = failed + ? WHERE id = ?`,
+    ).bind(now, ok ? 1 : 0, ok ? 0 : 1, r.run_id).run();
+    if (ok) result.campaignsSent++; else result.campaignsFailed++;
+  }
+
+  // Close finished runs and roll counters onto the campaign record.
+  const openRuns = await env.DB.prepare(`SELECT * FROM campaign_runs WHERE status IN ('scheduled','sending')`).all<Record<string, unknown>>();
+  for (const run of openRuns.results || []) {
+    const remaining = await env.DB.prepare(`SELECT COUNT(*) AS n FROM campaign_recipients WHERE run_id = ? AND status = 'queued'`)
+      .bind(run.id).first<Record<string, unknown>>();
+    if (Number(remaining?.n || 0) === 0 && Number(run.total || 0) > 0) {
+      await env.DB.prepare(`UPDATE campaign_runs SET status = 'complete', completed_at = ? WHERE id = ?`).bind(now, run.id).run();
+      await env.DB.prepare(
+        `UPDATE campaigns SET status = 'sent', sent_at = ?, sent_count = ?, updated_at = ? WHERE id = ?`,
+      ).bind(now, Number(run.sent || 0), now, run.campaign_id).run();
+    }
+  }
+
+  /* ── workflows ── */
+  const runs = await env.DB.prepare(
+    `SELECT * FROM workflow_runs WHERE status IN ('active','waiting') AND (next_run_at IS NULL OR next_run_at <= ?) ORDER BY next_run_at LIMIT ?`,
+  ).bind(now, BATCH).all<Record<string, unknown>>();
+
+  for (const run of runs.results || []) {
+    const wf = await env.DB.prepare('SELECT * FROM workflows WHERE id = ?').bind(run.workflow_id).first<Record<string, unknown>>();
+    if (!wf || Number(wf.is_active) === 0) {
+      await env.DB.prepare(`UPDATE workflow_runs SET status = 'cancelled', updated_at = ? WHERE id = ?`).bind(now, run.id).run();
+      continue;
+    }
+    const actions = safeJson<Record<string, any>[]>(wf.actions, []);
+    const idx = Number(run.step_index || 0);
+    if (idx >= actions.length) {
+      await env.DB.prepare(`UPDATE workflow_runs SET status = 'complete', updated_at = ? WHERE id = ?`).bind(now, run.id).run();
+      result.workflowsCompleted++;
+      continue;
+    }
+
+    const tenant = await env.DB.prepare('SELECT * FROM tenants WHERE id = ?').bind(run.tenant_id).first<Record<string, unknown>>() || {};
+    const contact = run.contact_id
+      ? await env.DB.prepare('SELECT * FROM contacts WHERE id = ?').bind(run.contact_id).first<Record<string, unknown>>()
+      : null;
+
+    let outcome: { log: string; delayMinutes?: number };
+    try {
+      outcome = await runWorkflowAction(env, actions[idx], { tenantId: String(run.tenant_id), contact, tenant });
+    } catch (e) {
+      outcome = { log: `action error: ${String(e).slice(0, 120)}` };
+    }
+    const log = safeJson<string[]>(run.log, []);
+    log.push(`${now} · step ${idx + 1}/${actions.length} · ${outcome.log}`);
+
+    const nextIndex = idx + 1;
+    const finished = nextIndex >= actions.length;
+    const nextAt = outcome.delayMinutes
+      ? new Date(Date.now() + outcome.delayMinutes * 60_000).toISOString()
+      : now;
+
+    await env.DB.prepare(
+      `UPDATE workflow_runs SET step_index = ?, status = ?, next_run_at = ?, log = ?, updated_at = ? WHERE id = ?`,
+    ).bind(nextIndex, finished ? 'complete' : (outcome.delayMinutes ? 'waiting' : 'active'), nextAt, JSON.stringify(log.slice(-50)), now, run.id).run();
+
+    result.workflowsAdvanced++;
+    if (finished) result.workflowsCompleted++;
+  }
+
+  return json({ ok: true, at: now, ...result });
+}
+
+/* ══════════════ CLIENT PORTAL — passwordless magic-link access ══════════════ */
+
+const PORTAL_LINK_TTL_MIN = 30;
+const PORTAL_SESSION_TTL_H = 12;
+
+async function portalRequestLink(env: Env, request: Request, body: Record<string, unknown>) {
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const email = String(body.email || '').trim().toLowerCase();
+  const tenantId = String(body.tenantId || '').trim();
+  if (!email) return bad('email_required');
+
+  let query = 'SELECT * FROM contacts WHERE lower(email) = ?';
+  const binds: unknown[] = [email];
+  if (tenantId) { query += ' AND tenant_id = ?'; binds.push(tenantId); }
+  const contact = await env.DB.prepare(query).bind(...binds).first<Record<string, unknown>>();
+
+  // Always answer 200 — never leak whether an address is on file.
+  if (!contact) return json({ ok: true, sent: true });
+
+  const token = randHex(32);
+  const now = Date.now();
+  await env.DB.prepare(
+    `INSERT INTO portal_tokens (id, tenant_id, contact_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+  ).bind(uuid(), contact.tenant_id, contact.id, await sha256(token),
+    new Date(now + PORTAL_LINK_TTL_MIN * 60_000).toISOString(), nowIso()).run();
+
+  const tenant = await env.DB.prepare('SELECT * FROM tenants WHERE id = ?').bind(contact.tenant_id).first<Record<string, unknown>>() || {};
+  const base = env.PORTAL_BASE_URL || new URL(request.url).origin;
+  const link = `${base}/#/portal?token=${token}`;
+
+  const mail = await safeSendEmail(env, {
+    to: email,
+    subject: `Your secure document portal link — ${tenant.business_name || tenant.name || 'Tax Pro Hub'}`,
+    text: `Hello ${contact.first_name || ''},\n\nUse this secure link to open your client portal. It expires in ${PORTAL_LINK_TTL_MIN} minutes and can only be used once:\n\n${link}\n\nIf you didn't request it, ignore this email.\n\n${tenant.business_name || tenant.name || ''}`,
+  });
+
+  await audit(env, { tenantId: String(contact.tenant_id), action: 'portal.link_requested', resource: 'contacts', resourceId: String(contact.id), details: { delivered: mail.ok }, request });
+  // `delivered` tells the operator whether the mail provider accepted it; the
+  // response never reveals whether the address exists.
+  return json({ ok: true, sent: true, delivered: mail.ok });
+}
+
+async function portalVerify(env: Env, request: Request, body: Record<string, unknown>) {
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+  const token = String(body.token || '');
+  if (!token) return bad('token_required');
+
+  const hash = await sha256(token);
+  const row = await env.DB.prepare(
+    `SELECT * FROM portal_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?`,
+  ).bind(hash, nowIso()).first<Record<string, unknown>>();
+  if (!row) return json({ ok: false, error: 'invalid_or_expired_link' }, 401);
+
+  await env.DB.prepare('UPDATE portal_tokens SET used_at = ? WHERE id = ?').bind(nowIso(), row.id).run();
+
+  const sessionToken = randHex(32);
+  await env.DB.prepare(
+    `INSERT INTO portal_sessions (id, tenant_id, contact_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+  ).bind(uuid(), row.tenant_id, row.contact_id, await sha256(sessionToken),
+    new Date(Date.now() + PORTAL_SESSION_TTL_H * 3_600_000).toISOString(), nowIso()).run();
+
+  await audit(env, { tenantId: String(row.tenant_id), action: 'portal.login', resource: 'contacts', resourceId: String(row.contact_id), request });
+  return json({ ok: true, token: sessionToken, expiresInHours: PORTAL_SESSION_TTL_H });
+}
+
+async function portalAuth(env: Env, request: Request) {
+  if (!env.DB) return null;
+  const token = tokenFromRequest(request);
+  if (!token) return null;
+  const row = await env.DB.prepare(
+    `SELECT * FROM portal_sessions WHERE token_hash = ? AND expires_at > ?`,
+  ).bind(await sha256(token), nowIso()).first<Record<string, unknown>>();
+  if (!row) return null;
+  const contact = await env.DB.prepare('SELECT * FROM contacts WHERE id = ?').bind(row.contact_id).first<Record<string, unknown>>();
+  if (!contact) return null;
+  return { tenantId: String(row.tenant_id), contact };
+}
+
+async function portalMe(env: Env, request: Request) {
+  const p = await portalAuth(env, request);
+  if (!p) return json({ ok: false, error: 'unauthenticated' }, 401);
+  const tenant = await env.DB!.prepare('SELECT * FROM tenants WHERE id = ?').bind(p.tenantId).first<Record<string, unknown>>() || {};
+  const deals = await env.DB!.prepare('SELECT id, name, stage_id, value, updated_at FROM deals WHERE contact_id = ? AND tenant_id = ?')
+    .bind(p.contact.id, p.tenantId).all<Record<string, unknown>>();
+  const appts = await env.DB!.prepare(
+    'SELECT id, title, start_time, status, location FROM appointments WHERE contact_id = ? AND tenant_id = ? ORDER BY start_time',
+  ).bind(p.contact.id, p.tenantId).all<Record<string, unknown>>();
+  const files = await env.DB!.prepare('SELECT * FROM files WHERE contact_id = ? AND tenant_id = ? ORDER BY created_at DESC')
+    .bind(p.contact.id, p.tenantId).all<Record<string, unknown>>();
+
+  return json({
+    ok: true,
+    contact: {
+      id: p.contact.id, firstName: p.contact.first_name, lastName: p.contact.last_name,
+      email: p.contact.email, phone: p.contact.phone, status: p.contact.status,
+    },
+    practice: { name: tenant.business_name || tenant.name, email: tenant.email, phone: tenant.phone, colors: safeJson(tenant.colors, {}) },
+    deals: deals.results || [],
+    appointments: appts.results || [],
+    files: (files.results || []).map(fileRowToPayload),
+  });
+}
+
+/** Client-side upload straight into the tenant's R2 vault, tagged to the contact. */
+async function portalUpload(env: Env, request: Request) {
+  const p = await portalAuth(env, request);
+  if (!p) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DOCS || !env.DB) return notConfigured('r2_document_vault', ['npm run cf:setup creates the R2 bucket']);
+
+  const form = await request.formData();
+  const f = form.get('file');
+  if (!(f instanceof File)) return bad('file_field_required');
+  if (f.size > MAX_UPLOAD_BYTES) return bad('file_too_large_max_50mb', 413);
+
+  const bytes = new Uint8Array(await f.arrayBuffer());
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  const checksum = Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  const id = uuid();
+  const safeName = (f.name || 'upload.bin').replace(/[^\w.\- ]+/g, '_').slice(0, 180);
+  const key = `tenants/${p.tenantId}/${id}/${safeName}`;
+
+  await env.DOCS.put(key, bytes, {
+    httpMetadata: { contentType: f.type || 'application/octet-stream' },
+    customMetadata: { tenantId: p.tenantId, contactId: String(p.contact.id), sha256: checksum, source: 'client-portal' },
+  });
+  const now = nowIso();
+  await env.DB.prepare(
+    `INSERT INTO files (id, tenant_id, contact_id, name, folder, doc_type, content_type, size, r2_key, sha256, uploaded_by, status, metadata, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'Client Uploads', ?, ?, ?, ?, ?, ?, 'stored', ?, ?, ?)`,
+  ).bind(id, p.tenantId, p.contact.id, safeName, String(form.get('docType') || 'Client Upload'),
+    f.type || 'application/octet-stream', f.size, key, checksum, `portal:${p.contact.id}`,
+    JSON.stringify({ source: 'client-portal' }), now, now).run();
+
+  await audit(env, { tenantId: p.tenantId, action: 'portal.upload', resource: 'files', resourceId: id, details: { name: safeName, size: f.size }, request });
+  const row = await env.DB.prepare('SELECT * FROM files WHERE id = ?').bind(id).first<Record<string, unknown>>();
+  return json({ ok: true, item: row ? fileRowToPayload(row) : { id, name: safeName } }, 201);
+}
+
+async function portalDownload(env: Env, request: Request, id: string) {
+  const p = await portalAuth(env, request);
+  if (!p) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DOCS || !env.DB) return notConfigured('r2_document_vault', ['npm run cf:setup']);
+  const row = await env.DB.prepare('SELECT * FROM files WHERE id = ? AND tenant_id = ? AND contact_id = ?')
+    .bind(id, p.tenantId, p.contact.id).first<Record<string, unknown>>();
+  if (!row) return json({ ok: false, error: 'not_found' }, 404);
+  const obj = await env.DOCS.get(String(row.r2_key));
+  if (!obj) return json({ ok: false, error: 'object_missing_in_r2' }, 410);
+  return new Response(obj.body, {
+    headers: {
+      'Content-Type': String(row.content_type || 'application/octet-stream'),
+      'Content-Disposition': `attachment; filename="${String(row.name).replace(/"/g, '')}"`,
+      'Cache-Control': 'private, no-store',
+    },
+  });
+}
+
 /* ═══════════════════════════ ROUTER ═══════════════════════════ */
 export const onRequest = async (ctx: Ctx): Promise<Response> => {
   const { request, env, params } = ctx;
@@ -957,6 +1452,39 @@ export const onRequest = async (ctx: Ctx): Promise<Response> => {
 
     /* ── Bootstrap ── */
     if (route === '/v1/bootstrap' && request.method === 'GET') return handleBootstrap(env, request);
+
+    /* ── Delivery engine ── */
+    if (request.method === 'POST' && /^\/campaigns\/[^/]+\/schedule$/.test(route)) {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return scheduleCampaign(env, request, route.split('/')[2], body);
+    }
+    if (request.method === 'POST' && /^\/campaigns\/[^/]+\/send-now$/.test(route)) {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return scheduleCampaign(env, request, route.split('/')[2], { ...body, sendAt: nowIso() });
+    }
+    if (request.method === 'GET' && /^\/campaigns\/[^/]+\/stats$/.test(route)) {
+      return campaignStats(env, request, route.split('/')[2]);
+    }
+    if (request.method === 'POST' && /^\/workflows\/[^/]+\/enroll$/.test(route)) {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return enrollWorkflow(env, request, route.split('/')[2], body);
+    }
+    if (route === '/cron/tick' && (request.method === 'POST' || request.method === 'GET')) return cronTick(env, request);
+
+    /* ── Client portal (passwordless) ── */
+    if (route === '/portal/request-link' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return portalRequestLink(env, request, body);
+    }
+    if (route === '/portal/verify' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      return portalVerify(env, request, body);
+    }
+    if (route === '/portal/me' && request.method === 'GET') return portalMe(env, request);
+    if (route === '/portal/files' && request.method === 'POST') return portalUpload(env, request);
+    if (/^\/portal\/files\/[^/]+\/download$/.test(route) && request.method === 'GET') {
+      return portalDownload(env, request, route.split('/')[3]);
+    }
 
     /* ── Secure document vault (R2) — must precede the generic CRUD block ── */
     if (route === '/v1/files' && request.method === 'GET') return listFiles(env, request, new URL(request.url));
