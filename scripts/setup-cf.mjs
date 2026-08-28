@@ -18,6 +18,7 @@ const CF = (cmd, opts = {}) => execSync(cmd, { cwd: ROOT, encoding: 'utf8', stdi
 
 const D1_NAME = 'taxprohub-crm';
 const KV_NAME = 'LEDGER';
+const R2_BUCKET = process.env.R2_BUCKET_NAME || 'taxprohub-docs';
 const PAGES_PROJECT = process.env.PAGES_PROJECT_NAME || 'tax-pro-hub-university';
 
 const ok = (m) => console.log(`  ✅ ${m}`);
@@ -46,7 +47,7 @@ function readToml() { return readFileSync(resolve(ROOT, 'wrangler.toml'), 'utf8'
 function writeToml(content) { writeFileSync(resolve(ROOT, 'wrangler.toml'), content); }
 
 /* ── 1) D1 ─────────────────────────────────────────────────────── */
-console.log('\n📦 [1/4] D1 database');
+console.log('\n📦 [1/5] D1 database');
 let d1 = wranglerJson(`d1 list`);
 // Some wrangler versions print a preamble + JSON hybrid; fall back to raw parse.
 if (!d1) {
@@ -79,7 +80,7 @@ if (!toml.includes(d1Id)) {
 }
 
 /* ── 2) KV ─────────────────────────────────────────────────────── */
-console.log('\n🔑 [2/4] KV namespace');
+console.log('\n🔑 [2/5] KV namespace');
 let kvs = wranglerJson('kv namespace list') || [];
 if (!kvs.length) {
   const raw = wranglerRaw('kv namespace list');
@@ -105,8 +106,25 @@ if (!toml.includes(kvId)) {
   ok('wrangler.toml KV id updated');
 }
 
-/* ── 3) Migrations ─────────────────────────────────────────────── */
-console.log('\n🧬 [3/4] D1 migrations');
+/* ── 3) R2 document vault ──────────────────────────────────────── */
+console.log('\n🗄  [3/5] R2 bucket (secure document vault)');
+{
+  const list = wranglerRaw('r2 bucket list');
+  if (list.includes(R2_BUCKET)) {
+    ok(`Found existing R2 bucket "${R2_BUCKET}"`);
+  } else {
+    try {
+      CF(`npx wrangler r2 bucket create ${R2_BUCKET}`);
+      ok(`Created R2 bucket "${R2_BUCKET}"`);
+    } catch (e) {
+      warn(`Could not create R2 bucket (token may lack R2:Edit): ${String(e).slice(0, 160)}`);
+      warn('Uploads will return 501 not_configured until the bucket exists.');
+    }
+  }
+}
+
+/* ── 4) Migrations ─────────────────────────────────────────────── */
+console.log('\n🧬 [4/5] D1 migrations');
 const migrationsDir = resolve(ROOT, 'migrations');
 if (existsSync(migrationsDir)) {
   const files = (await import('node:fs/promises')).readdir(migrationsDir).then((f) => f.filter((x) => x.endsWith('.sql')).sort());
@@ -121,8 +139,8 @@ if (existsSync(migrationsDir)) {
   }
 }
 
-/* ── 4) Pages project ──────────────────────────────────────────── */
-console.log('\n🌐 [4/4] Cloudflare Pages project');
+/* ── 5) Pages project ──────────────────────────────────────────── */
+console.log('\n🌐 [5/5] Cloudflare Pages project');
 try {
   CF(`npx wrangler pages project create ${PAGES_PROJECT} --production-branch main`, { stdio: ['ignore', 'pipe', 'pipe'] });
   ok(`Pages project "${PAGES_PROJECT}" ready`);

@@ -59,3 +59,10 @@ When adding a feature, never invent numbers to fill a panel. Either:
 1. derive it from the store (live D1 data), or
 2. render the empty state, or
 3. call the integration and show the `not_configured` stub from `/api/health`.
+
+## 5. Document vault (added with R2)
+
+Uploaded originals are **real objects in Cloudflare R2**, indexed in D1
+(`migrations/0002_files.sql`). The Document Intelligence page shows the live
+vault contents; when the bucket isn't provisioned it displays the
+`not_configured` hint from `/api/health` rather than a fake file list.

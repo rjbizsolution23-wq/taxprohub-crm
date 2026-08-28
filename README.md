@@ -138,6 +138,29 @@ Functions) against **D1** with per-tenant isolation:
 Full audit & architecture: [`ANALYSIS.md`](./ANALYSIS.md) ·
 Deployment: [`docs/DEPLOYMENT_RUNBOOK.md`](./docs/DEPLOYMENT_RUNBOOK.md)
 
+## 🗄️ SECURE DOCUMENT VAULT (Cloudflare R2)
+
+Originals dropped into **Document Intelligence** are OCR'd on-device and then
+archived to R2 (`DOCS` binding) with a tenant-scoped D1 index:
+
+| Route | Purpose |
+|---|---|
+| `GET /api/v1/files?contactId=&q=` | vault index for the signed-in tenant |
+| `POST /api/v1/files` | multipart or raw upload (50 MB cap, SHA-256 recorded) |
+| `GET /api/v1/files/:id/download` | streams the object back through the Worker |
+| `DELETE /api/v1/files/:id` | removes the object + index row |
+
+Objects are keyed `tenants/{tenantId}/{uuid}/{filename}` — never public, every
+read/write written to `audit_logs`.
+
+## 🚢 SHIP IT
+
+```bash
+export CLOUDFLARE_API_TOKEN=...   # Pages/D1/KV/Workers/R2 Edit
+export CLOUDFLARE_ACCOUNT_ID=...
+npm ci && npm run ship            # provision → migrate → build → deploy → verify
+```
+
 ## 📊 DATA POLICY — LIVE ONLY
 
 The UI renders **live tenant data from Cloudflare D1**. The only fabricated

@@ -45,6 +45,7 @@
 interface Env {
   DB?: D1Database;
   LEDGER?: KVNamespace;
+  DOCS?: R2Bucket;
   TWILIO_ACCOUNT_SID?: string;
   TWILIO_AUTH_TOKEN?: string;
   TWILIO_FROM_NUMBER?: string;
@@ -763,6 +764,7 @@ function health(env: Env) {
     integrations: {
       database_d1: !!env.DB,
       kv_ledger: !!env.LEDGER,
+      r2_document_vault: !!env.DOCS,
       twilio_sms: !!(env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && env.TWILIO_FROM_NUMBER),
       stripe: !!env.STRIPE_SECRET_KEY,
       stripe_webhooks: !!env.STRIPE_WEBHOOK_SECRET,
@@ -779,6 +781,152 @@ function health(env: Env) {
       llm: 'wrangler pages secret put OPENAI_API_KEY (+ OPENAI_BASE_URL for any compatible provider)',
     },
   });
+}
+
+
+/* ═══════════════ SECURE DOCUMENT VAULT (R2 + D1 index) ═══════════════ */
+
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MB per object
+
+const fileRowToPayload = (row: Record<string, unknown>) => ({
+  id: row.id,
+  subAccountId: row.tenant_id,
+  contactId: row.contact_id || null,
+  dealId: row.deal_id || null,
+  name: row.name,
+  folder: row.folder,
+  docType: row.doc_type,
+  taxYear: row.tax_year || null,
+  contentType: row.content_type,
+  size: Number(row.size || 0),
+  sha256: row.sha256 || null,
+  uploadedBy: row.uploaded_by || null,
+  status: row.status,
+  metadata: safeJson(row.metadata, {}),
+  createdAt: row.created_at,
+  updatedAt: row.updated_at,
+  downloadUrl: `/api/v1/files/${row.id}/download`,
+});
+
+async function listFiles(env: Env, request: Request, url: URL) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['Create the D1 database: npm run cf:setup']);
+
+  const contactId = url.searchParams.get('contactId');
+  const q = (url.searchParams.get('q') || '').trim();
+  const limit = Math.min(Number(url.searchParams.get('limit') || 200), 500);
+  const offset = Number(url.searchParams.get('offset') || 0);
+
+  const where: string[] = ['tenant_id = ?'];
+  const binds: unknown[] = [a.tenant.id];
+  if (contactId) { where.push('contact_id = ?'); binds.push(contactId); }
+  if (q) { where.push('(name LIKE ? OR folder LIKE ? OR doc_type LIKE ?)'); binds.push(`%${q}%`, `%${q}%`, `%${q}%`); }
+
+  const rows = await env.DB.prepare(
+    `SELECT * FROM files WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+  ).bind(...binds, limit, offset).all<Record<string, unknown>>();
+
+  return json({ ok: true, items: (rows.results || []).map(fileRowToPayload), count: (rows.results || []).length });
+}
+
+async function uploadFile(env: Env, request: Request) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DOCS) return notConfigured('r2_document_vault', ['Create the R2 bucket: npm run cf:setup (or wrangler r2 bucket create taxprohub-docs)']);
+  if (!env.DB) return notConfigured('database', ['Create the D1 database: npm run cf:setup']);
+
+  const contentType = request.headers.get('Content-Type') || '';
+  let blob: Blob | null = null;
+  let name = 'upload.bin';
+  let meta: Record<string, string> = {};
+
+  if (contentType.includes('multipart/form-data')) {
+    const form = await request.formData();
+    const f = form.get('file');
+    if (!(f instanceof File)) return bad('file_field_required');
+    blob = f;
+    name = f.name || name;
+    form.forEach((v, k) => { if (k !== 'file' && typeof v === 'string') meta[k] = v; });
+  } else {
+    // Raw binary upload: metadata travels in X-File-* headers / query string.
+    const url = new URL(request.url);
+    blob = await request.blob();
+    name = request.headers.get('X-File-Name') || url.searchParams.get('name') || name;
+    url.searchParams.forEach((v, k) => { if (k !== 'name') meta[k] = v; });
+  }
+
+  const size = blob.size;
+  if (!size) return bad('empty_file');
+  if (size > MAX_UPLOAD_BYTES) return bad('file_too_large_max_50mb', 413);
+
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  const checksum = Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+
+  const id = uuid();
+  const safeName = name.replace(/[^\w.\- ]+/g, '_').slice(0, 180);
+  const key = `tenants/${a.tenant.id}/${id}/${safeName}`;
+
+  await env.DOCS.put(key, bytes, {
+    httpMetadata: { contentType: blob.type || 'application/octet-stream', contentDisposition: `attachment; filename="${safeName}"` },
+    customMetadata: { tenantId: String(a.tenant.id), uploadedBy: String(a.user.id), sha256: checksum },
+  });
+
+  const now = nowIso();
+  await env.DB.prepare(
+    `INSERT INTO files (id, tenant_id, contact_id, deal_id, name, folder, doc_type, tax_year,
+                        content_type, size, r2_key, sha256, uploaded_by, status, metadata, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'stored', ?, ?, ?)`,
+  ).bind(
+    id, a.tenant.id, meta.contactId || null, meta.dealId || null, safeName,
+    meta.folder || 'General', meta.docType || 'Other', meta.taxYear || null,
+    blob.type || 'application/octet-stream', size, key, checksum, a.user.id,
+    JSON.stringify(meta), now, now,
+  ).run();
+
+  await audit(env, { tenantId: String(a.tenant.id), userId: String(a.user.id), action: 'file.upload', resource: 'files', resourceId: id, details: { name: safeName, size }, request });
+
+  const row = await env.DB.prepare('SELECT * FROM files WHERE id = ?').bind(id).first<Record<string, unknown>>();
+  return json({ ok: true, item: row ? fileRowToPayload(row) : { id, name: safeName } }, 201);
+}
+
+async function downloadFile(env: Env, request: Request, id: string) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DOCS || !env.DB) return notConfigured('r2_document_vault', ['npm run cf:setup creates the R2 bucket + D1 database']);
+
+  const row = await env.DB.prepare('SELECT * FROM files WHERE id = ? AND tenant_id = ?')
+    .bind(id, a.tenant.id).first<Record<string, unknown>>();
+  if (!row) return json({ ok: false, error: 'not_found' }, 404);
+
+  const obj = await env.DOCS.get(String(row.r2_key));
+  if (!obj) return json({ ok: false, error: 'object_missing_in_r2' }, 410);
+
+  await audit(env, { tenantId: String(a.tenant.id), userId: String(a.user.id), action: 'file.download', resource: 'files', resourceId: id, request });
+
+  return new Response(obj.body, {
+    headers: {
+      'Content-Type': String(row.content_type || 'application/octet-stream'),
+      'Content-Disposition': `attachment; filename="${String(row.name).replace(/"/g, '')}"`,
+      'Cache-Control': 'private, no-store',
+    },
+  });
+}
+
+async function deleteFile(env: Env, request: Request, id: string) {
+  const a = await auth(env, request);
+  if (!a) return json({ ok: false, error: 'unauthenticated' }, 401);
+  if (!env.DB) return notConfigured('database', ['npm run cf:setup']);
+
+  const row = await env.DB.prepare('SELECT * FROM files WHERE id = ? AND tenant_id = ?')
+    .bind(id, a.tenant.id).first<Record<string, unknown>>();
+  if (!row) return json({ ok: false, error: 'not_found' }, 404);
+
+  if (env.DOCS) { try { await env.DOCS.delete(String(row.r2_key)); } catch { /* orphan cleanup happens on lifecycle rule */ } }
+  await env.DB.prepare('DELETE FROM files WHERE id = ? AND tenant_id = ?').bind(id, a.tenant.id).run();
+  await audit(env, { tenantId: String(a.tenant.id), userId: String(a.user.id), action: 'file.delete', resource: 'files', resourceId: id, request });
+  return json({ ok: true, deleted: id });
 }
 
 /* ═══════════════════════════ ROUTER ═══════════════════════════ */
@@ -809,6 +957,18 @@ export const onRequest = async (ctx: Ctx): Promise<Response> => {
 
     /* ── Bootstrap ── */
     if (route === '/v1/bootstrap' && request.method === 'GET') return handleBootstrap(env, request);
+
+    /* ── Secure document vault (R2) — must precede the generic CRUD block ── */
+    if (route === '/v1/files' && request.method === 'GET') return listFiles(env, request, new URL(request.url));
+    if (route === '/v1/files' && request.method === 'POST') return uploadFile(env, request);
+    if (route.startsWith('/v1/files/')) {
+      const parts = route.split('/').filter(Boolean); // ['v1','files',id,'download'?]
+      const fileId = parts[2];
+      if (parts[3] === 'download' && request.method === 'GET') return downloadFile(env, request, fileId);
+      if (request.method === 'GET') return downloadFile(env, request, fileId);
+      if (request.method === 'DELETE') return deleteFile(env, request, fileId);
+      return json({ ok: false, error: 'method_not_allowed' }, 405);
+    }
 
     /* ── Generic CRUD: /api/v1/:entity[/:id] ── */
     if (route.startsWith('/v1/')) {

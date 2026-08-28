@@ -25,13 +25,54 @@ and scripted; the only manual step is creating the API token and secrets.
 | Account · **D1 — Edit** | All accounts |
 | Account · **Workers KV Storage — Edit** | All accounts |
 | Account · **Workers Scripts — Edit** | All accounts |
+| Account · **Workers R2 Storage — Edit** | All accounts | (document vault)
 
 3. Copy the token. **Never commit it.**
 4. Note your **Account ID** (right sidebar of the dashboard).
 
 ---
 
-## 2. One-command setup (D1 + KV + migrations + Pages project)
+## 1b. Fastest path — ONE command
+
+```bash
+export CLOUDFLARE_API_TOKEN=...      # custom token from step 1
+export CLOUDFLARE_ACCOUNT_ID=...     # 32-char account id
+npm ci && npm run ship
+```
+
+`npm run ship` verifies the token, provisions **D1 + KV + R2 + the Pages
+project**, applies every migration, typechecks, builds, pushes any secrets it
+finds in the environment, deploys, then polls the live `/api/health` and prints
+the integration board. Everything below is the manual breakdown of that script.
+
+---
+
+## 1c. No-CLI path — deploy straight from the Cloudflare dashboard
+
+If you'd rather not run anything locally:
+
+1. **Workers & Pages → Create → Pages → Connect to Git** → pick
+   `rjbizsolution23-wq/taxprohub-crm`, branch `main` (or this arena branch).
+   Build command `npm run build`, output directory `dist`.
+2. **Storage & Databases → D1 → Create** → name `taxprohub-crm`.
+   Open its **Console** tab and paste the contents of `migrations/0001_init.sql`,
+   run it, then paste `migrations/0002_files.sql` and run that too.
+3. **R2 → Create bucket** → `taxprohub-docs`.
+4. **KV → Create namespace** → `LEDGER`.
+5. Back on the Pages project → **Settings → Bindings → Add**:
+   | Type | Variable name | Resource |
+   |---|---|---|
+   | D1 database | `DB` | `taxprohub-crm` |
+   | KV namespace | `LEDGER` | `LEDGER` |
+   | R2 bucket | `DOCS` | `taxprohub-docs` |
+6. **Settings → Variables and Secrets** → add `SESSION_SECRET` (any long random
+   string) plus whichever provider keys you use (Twilio, Stripe, Resend, OpenAI).
+7. **Deployments → Retry deployment**, then open `/api/health` — every bound
+   service should report `true`.
+
+---
+
+## 2. One-command setup (D1 + KV + R2 + migrations + Pages project)
 
 ```bash
 export CLOUDFLARE_API_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
@@ -44,8 +85,9 @@ npm run cf:setup
 `cf:setup` (scripts/setup-cf.mjs) will:
 1. Detect or create the D1 database **`taxprohub-crm`** and write its id into `wrangler.toml`
 2. Detect or create the KV namespace **`LEDGER`** and write its id into `wrangler.toml`
-3. Apply `migrations/0001_init.sql` (18 tables) to D1
-4. Ensure the Pages project **`tax-pro-hub-university`** exists (production branch `main`)
+3. Detect or create the R2 bucket **`taxprohub-docs`** (secure document vault)
+4. Apply every file in `migrations/` (`0001_init.sql` → 18 tables, `0002_files.sql` → vault index) to D1
+5. Ensure the Pages project **`tax-pro-hub-university`** exists (production branch `main`)
 
 Re-running is safe.
 
@@ -168,14 +210,16 @@ Local D1 persists in `.wrangler/state`. To reset local data:
 ## Appendix: GitHub Actions workflow (`.github/workflows/deploy.yml`)
 
 > This file exists in the working tree but **cannot be pushed by the Arena GitHub App**
-> (a GitHub App needs the `workflows` permission to create/update workflow files).
+> (a GitHub App needs the `workflows` permission to create/update workflow files,
+> and the same restriction applies to the REST contents API).
 > Add it yourself: GitHub → *Add file → Create new file* → path
 > `.github/workflows/deploy.yml` → paste the YAML below → Commit.
 >
 > Then add the two repository secrets (Settings → Secrets and variables → Actions):
 > `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`, and run the workflow
 > (Actions → *Deploy to Cloudflare Pages* → *Run workflow*). CI does the whole
-> job: create D1 + KV, apply migrations, create the Pages project, deploy.
+> job: create D1 + KV + R2, apply migrations, create the Pages project, deploy,
+> then verify `/api/health` reports `database_d1: true`.
 
 ```yaml
 name: Deploy to Cloudflare Pages
@@ -289,4 +333,14 @@ jobs:
             --project-name tax-pro-hub-university \
             --branch main \
             --commit-dirty=true
+
+      - name: Verify live /api/health
+        run: |
+          for i in $(seq 1 12); do
+            body=$(curl -fsS https://tax-pro-hub-university.pages.dev/api/health || true)
+            echo "$body"
+            if echo "$body" | grep -q '"database_d1":true'; then exit 0; fi
+            sleep 10
+          done
+          echo "::warning::database_d1 not reporting true yet — check the Pages project bindings."
 ```

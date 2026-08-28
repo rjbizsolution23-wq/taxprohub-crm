@@ -39,3 +39,9 @@ id = "efc2da2c19934e68a956a84bfe76f7a2"
 binding = "DB"
 database_name = "taxprohub-crm"
 database_id = "00000000-0000-0000-0000-000000000000"
+
+# ── Secure document vault (R2) — created by `npm run cf:setup` ───────
+# Or manually: npx wrangler r2 bucket create taxprohub-docs
+[[r2_buckets]]
+binding = "DOCS"
+bucket_name = "taxprohub-docs"

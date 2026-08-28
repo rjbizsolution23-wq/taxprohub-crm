@@ -5,17 +5,21 @@
  * everything into the CRM (contact + deal) with one click.
  */
 
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   FileUp, ScanLine, Cpu, ShieldCheck, CheckCircle2, AlertTriangle,
   UserPlus, Briefcase, ArrowRight, FileText, Sparkles, Eye, X, Layers, Lock,
-  FolderOpen, Wand2, User, FolderTree, Zap,
+  FolderOpen, Wand2, User, FolderTree, Zap, CloudUpload, Download, Trash2, Database,
 } from 'lucide-react';
 import { runOCR, type OCRResult } from '../utils/ocr';
 import { parseTaxDocument, type ParsedTaxDocument, type ExtractedField } from '../utils/taxDocParser';
 import { autofillCRM, type AutofillResult } from '../utils/crmAutofill';
 import { buildFilingPlan, type FilingPlan } from '../utils/smartFiling';
+import {
+  listVaultFiles, uploadVaultFile, deleteVaultFile, downloadVaultFile, humanSize,
+  type VaultFile,
+} from '../utils/vault';
 
 type Phase = 'idle' | 'ocr' | 'parsed' | 'injected';
 
@@ -51,6 +55,44 @@ export default function DocumentIntelligence() {
   const [showRawText, setShowRawText] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  /* ── Secure Document Vault (Cloudflare R2) ─────────────────────────── */
+  const [vaultFiles, setVaultFiles] = useState<VaultFile[]>([]);
+  const [vaultState, setVaultState] = useState<'checking' | 'ready' | 'unconfigured' | 'signedout'>('checking');
+  const [vaultHint, setVaultHint] = useState<string>('');
+  const [vaultBusy, setVaultBusy] = useState(false);
+
+  const refreshVault = useCallback(async () => {
+    const res = await listVaultFiles({ limit: 100 });
+    if (res.ok) { setVaultFiles(res.items); setVaultState('ready'); return true; }
+    if (res.status === 401) { setVaultState('signedout'); return false; }
+    setVaultState('unconfigured');
+    setVaultHint(res.hint || res.error || 'Vault unavailable');
+    return false;
+  }, []);
+
+  useEffect(() => { void refreshVault(); }, [refreshVault]);
+
+  const archiveToVault = useCallback(async (processed: ProcessedDoc[]) => {
+    if (vaultState !== 'ready' || processed.length === 0) return;
+    setVaultBusy(true);
+    for (const d of processed) {
+      await uploadVaultFile(d.file, {
+        folder: d.plan.folder,
+        docType: d.parsed.formType,
+        taxYear: d.parsed.taxYear,
+      });
+    }
+    await refreshVault();
+    setVaultBusy(false);
+  }, [vaultState, refreshVault]);
+
+  const removeFromVault = async (id: string) => {
+    setVaultBusy(true);
+    await deleteVaultFile(id);
+    await refreshVault();
+    setVaultBusy(false);
+  };
+
   const doc = docs[selectedIdx] ?? null;
 
   const processFiles = useCallback(async (files: File[]) => {
@@ -74,12 +116,13 @@ export default function DocumentIntelligence() {
       setDocs(results);
       setBatchInfo(null);
       setPhase('parsed');
+      void archiveToVault(results);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'OCR engine failed to process this file.');
       setBatchInfo(null);
       if (results.length > 0) { setDocs(results); setPhase('parsed'); } else { setPhase('idle'); }
     }
-  }, []);
+  }, [archiveToVault]);
 
   const onDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -493,6 +536,87 @@ export default function DocumentIntelligence() {
           </div>
         </div>
       )}
+
+      {/* ═══════════ SECURE DOCUMENT VAULT — Cloudflare R2 ═══════════ */}
+      <div className="rounded-3xl bg-white/[0.03] border border-white/10 backdrop-blur-xl p-6 space-y-4">
+        <div className="flex items-start justify-between flex-wrap gap-3">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-2xl bg-gradient-to-br from-cyan-500/25 to-blue-600/10 border border-cyan-500/40 grid place-items-center">
+              <Database className="w-4 h-4 text-cyan-300" />
+            </div>
+            <div>
+              <h2 className="text-lg font-bold text-white">Secure Document Vault</h2>
+              <p className="text-xs text-gray-400">
+                Originals are archived to Cloudflare R2 and indexed in D1 — tenant-scoped, never public.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 text-xs">
+            {vaultBusy && (
+              <span className="px-3 py-1.5 rounded-full bg-amber-500/10 border border-amber-500/30 text-amber-300 flex items-center gap-1.5">
+                <CloudUpload className="w-3 h-3 animate-pulse" /> Syncing…
+              </span>
+            )}
+            {vaultState === 'ready' && (
+              <span className="px-3 py-1.5 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-300">
+                Vault online · {vaultFiles.length} object{vaultFiles.length === 1 ? '' : 's'}
+              </span>
+            )}
+            {vaultState === 'signedout' && (
+              <span className="px-3 py-1.5 rounded-full bg-slate-500/10 border border-slate-500/30 text-slate-300">
+                Sign in to archive documents
+              </span>
+            )}
+            {vaultState === 'unconfigured' && (
+              <span className="px-3 py-1.5 rounded-full bg-amber-500/10 border border-amber-500/30 text-amber-300">
+                Not provisioned
+              </span>
+            )}
+          </div>
+        </div>
+
+        {vaultState === 'unconfigured' && (
+          <div className="text-xs text-amber-300/90 bg-amber-500/5 border border-amber-500/20 rounded-2xl p-3 font-mono">
+            {vaultHint || 'Run `npm run cf:setup` to create the R2 bucket + D1 index, then redeploy.'}
+          </div>
+        )}
+
+        {vaultState === 'ready' && vaultFiles.length === 0 && (
+          <div className="text-xs text-gray-500 border border-dashed border-white/10 rounded-2xl p-6 text-center">
+            No documents archived yet. Drop a return above — the original is stored automatically.
+          </div>
+        )}
+
+        {vaultFiles.length > 0 && (
+          <div className="divide-y divide-white/5 rounded-2xl border border-white/10 overflow-hidden">
+            {vaultFiles.map((f) => (
+              <div key={f.id} className="flex items-center gap-3 p-3 hover:bg-white/[0.03]">
+                <FileText className="w-4 h-4 text-amber-400 shrink-0" />
+                <div className="min-w-0 flex-1">
+                  <div className="text-sm text-white truncate">{f.name}</div>
+                  <div className="text-[11px] text-gray-500">
+                    {f.folder} · {f.docType}{f.taxYear ? ` · TY${f.taxYear}` : ''} · {humanSize(f.size)} · {new Date(f.createdAt).toLocaleString()}
+                  </div>
+                </div>
+                <button
+                  onClick={() => downloadVaultFile(f.id, f.name)}
+                  className="p-2 rounded-xl hover:bg-white/10 text-gray-300"
+                  title="Download from R2"
+                >
+                  <Download className="w-4 h-4" />
+                </button>
+                <button
+                  onClick={() => removeFromVault(f.id)}
+                  className="p-2 rounded-xl hover:bg-red-500/10 text-red-400"
+                  title="Delete permanently"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
