@@ -3,17 +3,10 @@ import { useAppStore } from '../store';
 import { Plus, BookOpen, Edit, Trash2, Eye, Calendar, Sparkles, Award } from 'lucide-react';
 import AIPromptBar from '../components/layout/AIPromptBar';
 
-const samplePosts = [
-  { id: '1', title: '5 Tax Deductions You Might Be Missing', slug: 'tax-deductions-you-might-miss', content: '...', excerpt: 'Discover often-overlooked tax deductions that could save you money this tax season.', featuredImage: '', authorId: '1', status: 'published' as const, tags: ['tax tips', 'deductions'], publishedAt: new Date(Date.now() - 86400000 * 5), createdAt: new Date(), updatedAt: new Date() },
-  { id: '2', title: 'How to Prepare for Tax Season 2026', slug: 'prepare-tax-season-2026', content: '...', excerpt: 'Get ready for tax season with our comprehensive preparation guide.', featuredImage: '', authorId: '1', status: 'published' as const, tags: ['tax season', 'preparation'], publishedAt: new Date(Date.now() - 86400000 * 10), createdAt: new Date(), updatedAt: new Date() },
-  { id: '3', title: 'Understanding Quarterly Estimated Taxes', slug: 'quarterly-estimated-taxes', content: '...', excerpt: 'Learn who needs to pay estimated taxes and how to calculate them.', featuredImage: '', authorId: '1', status: 'published' as const, tags: ['estimated taxes', 'quarterly'], publishedAt: new Date(Date.now() - 86400000 * 15), createdAt: new Date(), updatedAt: new Date() },
-  { id: '4', title: 'Small Business Tax Credits for 2026', slug: 'small-business-tax-credits-2026', content: '...', excerpt: 'Explore available tax credits for small businesses.', featuredImage: '', authorId: '1', status: 'draft' as const, tags: ['business', 'tax credits'], createdAt: new Date(), updatedAt: new Date() },
-];
-
 export default function BlogPage() {
   const navigate = useNavigate();
   const { blogPosts, deleteBlogPost } = useAppStore();
-  const allPosts = blogPosts.length > 0 ? blogPosts : samplePosts;
+  const allPosts = blogPosts;
 
   const getStatusBadge = (status: string) => {
     switch (status) {

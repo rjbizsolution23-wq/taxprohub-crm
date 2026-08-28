@@ -138,6 +138,16 @@ Functions) against **D1** with per-tenant isolation:
 Full audit & architecture: [`ANALYSIS.md`](./ANALYSIS.md) ·
 Deployment: [`docs/DEPLOYMENT_RUNBOOK.md`](./docs/DEPLOYMENT_RUNBOOK.md)
 
+## 📊 DATA POLICY — LIVE ONLY
+
+The UI renders **live tenant data from Cloudflare D1**. The only fabricated
+content in the entire product is a bounded demo seed of **2 sample records per
+core object** (`src/data/demoSeed.ts`), shown only when no backend session is
+active and wiped the instant a real tenant hydrates. Everything else is live,
+an empty-state placeholder, or a labelled "Showcase Simulation".
+
+Full breakdown: [`docs/DATA_POLICY.md`](docs/DATA_POLICY.md).
+
 ## 🛡️ INTELLECTUAL PROPERTY & COMPLIANCE SIGNATURES
 * **Product Name**: RJ Business Solutions Tax Pro Hub University
 * **Owner & Operator**: Rick Jefferson

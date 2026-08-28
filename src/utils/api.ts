@@ -69,6 +69,13 @@ export async function apiHealth(): Promise<boolean> {
   return backendHealthy;
 }
 
+/** Full /api/health payload (integration flags) for live status dashboards. */
+export async function apiHealthDetail(): Promise<{ ok: boolean; integrations: Record<string, boolean> }> {
+  const res = await apiFetch('/api/health');
+  const integrations = ((res.data as any)?.integrations || {}) as Record<string, boolean>;
+  return { ok: res.ok, integrations };
+}
+
 export const isBackendConfigured = () => backendHealthy === true;
 
 export function resetHealthCache() { backendHealthy = null; }

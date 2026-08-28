@@ -26,33 +26,17 @@ const taxHashtagGroups = [
   { name: 'Tax Season Launch', tags: ['#TaxRefund', '#FileTaxes', '#IRS', '#TaxPlanning', '#TaxProHubUniversity'] }
 ];
 
-const sampleSocialAccounts = [
-  { id: '1', platform: 'facebook', accountName: 'Tax Pro Hub University', accountId: 'myvirtualtax', connected: true, lastSynced: 'Just now', logoText: 'FB' },
-  { id: '2', platform: 'instagram', accountName: '@myvirtualtax_pro', accountId: 'myvirtualtax_pro', connected: true, lastSynced: '5m ago', logoText: 'IG' },
-  { id: '3', platform: 'linkedin', accountName: 'Tax Pro Hub University (Practice)', accountId: 'myvirtual-tax', connected: true, lastSynced: '1h ago', logoText: 'LI' },
-  { id: '4', platform: 'twitter', accountName: '@TaxProHubUniversity', accountId: 'myvirtualtax', connected: true, lastSynced: '2h ago', logoText: 'X' },
-  { id: '5', platform: 'tiktok', accountName: '@myvirtualtax', accountId: 'myvirtualtax', connected: false, logoText: 'TT' },
-  { id: '6', platform: 'google', accountName: 'GBP Albuquerque Office', accountId: 'myvirtual_gbp', connected: true, lastSynced: '1d ago', logoText: 'G' }
-];
+// LIVE: social accounts are populated by OAuth connections (Settings → Integrations).
+const sampleSocialAccounts: any[] = []
 
-const initialQueue = [
-  { id: 'q-1', time: '09:00 AM', platform: 'facebook', title: 'Why Rideshare Drivers Overpay $3,000/yr', type: 'Educational', status: 'scheduled' },
-  { id: 'q-2', time: '11:15 AM', platform: 'instagram', title: 'Schedule C Tax Deductions Checklist Reel', type: 'Testimonial', status: 'needs_approval' },
-  { id: 'q-3', time: '02:30 PM', platform: 'linkedin', title: 'S-Corp vs LLC tax planning guide', type: 'Promo', status: 'scheduled' },
-  { id: 'q-4', time: '05:00 PM', platform: 'twitter', title: 'X-Thread: 10 hidden writeoffs for creators', type: 'Educational', status: 'scheduled' }
-];
+// LIVE: scheduled posts load from the backend once a social provider is connected.
+const initialQueue: any[] = []
 
-const inboxItems = [
-  { id: 'msg-1', name: 'Alvarez Consults', text: 'Hey there! How much do you charge for S-Corp quarterly setup?', platform: 'facebook', time: '2m ago', score: 94, category: 'Lead' },
-  { id: 'msg-2', name: '@thecryptodriver', text: 'Does your AI scanner parse crypto transactions from Uniswap?', platform: 'instagram', time: '14m ago', score: 87, category: 'Question' },
-  { id: 'msg-3', name: 'Sarah Jenkins', text: 'Thank you for the fast document verification, uploaded everything!', platform: 'linkedin', time: '1h ago', score: 65, category: 'Support' }
-];
+// LIVE: unified inbox messages stream from connected provider webhooks.
+const inboxItems: any[] = []
 
-const socialListeningPings = [
-  { id: 'p-1', keyword: '#TaxTok', source: 'TikTok Creator Hub', text: 'Self-employed tax writeoffs searches up +340% this week.', sentiment: 'positive' },
-  { id: 'p-2', keyword: 'Circular 230', source: 'IRS Policy Feed', text: 'IRS issues updated disclaimer rules for social media representations.', sentiment: 'neutral' },
-  { id: 'p-3', keyword: 'Tax Prep Near Me', source: 'Google Local Map Trends', text: 'Local keyword intent in Tijeras, NM up 50% year-over-year.', sentiment: 'positive' }
-];
+// LIVE: listening pings require a connected listening provider.
+const socialListeningPings: any[] = []
 
 export default function SocialPage() {
   const { currentSubAccount } = useAppStore();

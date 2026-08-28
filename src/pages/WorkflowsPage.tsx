@@ -128,17 +128,9 @@ export default function WorkflowsPage() {
     });
   };
 
-  // Sample static workflows if store is empty
-  const sampleWorkflows = useMemo(() => [
-    { id: '1', name: 'New Client Onboarding Flow', trigger: { type: 'form_submitted' }, actions: [{ id: 'a1', type: 'send_email' }, { id: 'a2', type: 'add_tag' }], isActive: true, runs30d: 1424, successRate: 98.4 },
-    { id: '2', name: 'Returning Client Re-Engagement', trigger: { type: 'appointment_scheduled' }, actions: [{ id: 'a1', type: 'send_sms' }], isActive: true, runs30d: 841, successRate: 99.1 },
-    { id: '3', name: 'W-2 Collection Reminder Cascade', trigger: { type: 'deal_stage_changed' }, actions: [{ id: 'a1', type: 'send_email' }, { id: 'a2', type: 'create_task' }], isActive: false, runs30d: 320, successRate: 94.7 },
-    { id: '4', name: 'IRS CP2000 Notice Response Parser', trigger: { type: 'form_submitted' }, actions: [{ id: 'a1', type: 'webhook' }, { id: 'a2', type: 'send_email' }], isActive: true, runs30d: 1192, successRate: 100.0 }
-  ], []);
-
-  const allActiveWorkflows = useMemo(() => {
-    return workflows.length > 0 ? workflows : sampleWorkflows;
-  }, [workflows, sampleWorkflows]);
+  // LIVE workflows only — no fabricated automations. Empty practices render
+  // the empty-state placeholder and the template gallery below.
+  const allActiveWorkflows = useMemo(() => workflows, [workflows]);
 
   // Filter templates based on search & category
   const filteredTemplates = useMemo(() => {

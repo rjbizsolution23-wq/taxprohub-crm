@@ -256,7 +256,7 @@ export async function verifyMetaSignature(
 }
 
 /**
- * Mock resolver implementing Graph API Lead Ads profile expansion.
+ * Live resolver implementing Graph API Lead Ads profile expansion.
  */
 export async function fetchLeadFromGraphAPI(
   leadId: string,
@@ -265,23 +265,8 @@ export async function fetchLeadFromGraphAPI(
   const config = getAppConfig();
   
   if (!config.facebookAccessToken) {
-    // Return standard mock payload if disconnected
-    return {
-      id: leadId,
-      created_time: new Date().toISOString(),
-      ad_id: 'ad_987654321',
-      ad_name: 'Tax Seasonal Prep Retargeting 2026',
-      adset_id: 'set_48291028',
-      campaign_id: 'cam_74839201',
-      form_id: 'form_1029384756',
-      field_data: [
-        { name: 'full_name', values: ['Rick Jefferson'] },
-        { name: 'email', values: ['rjbizsolution23@gmail.com'] },
-        { name: 'phone', values: ['+14144304277'] },
-        { name: 'company_name', values: ['RJ Business Solutions'] },
-        { name: 'filing_status', values: ['S-Corp Business & Household'] },
-      ],
-    };
+    // NOT CONFIGURED → fail loudly instead of inventing a lead.
+    throw new Error('Meta Lead Ads is not configured. Add a Facebook access token in Settings → Integrations.');
   }
 
   try {
@@ -374,42 +359,10 @@ export async function fetchCampaignInsights(
   const isConfigured = !!config.facebookAccessToken && !!config.facebookAppId;
 
   if (!isConfigured) {
-    // Generate realistic mock telemetry matching tax campaigns
-    return [
-      {
-        campaignId: 'cam_74839201',
-        campaignName: '✦ Tax Pro Hub University - Seasonal Prep Retargeting 2026',
-        impressions: 48920,
-        clicks: 3410,
-        spend: 1245.50,
-        reach: 22400,
-        conversions: 248,
-        cpc: 0.36,
-        cpl: 5.02,
-      },
-      {
-        campaignId: 'cam_92810382',
-        campaignName: '✦ Tax Pro Hub University - Tax Return & IRS Direct Solutions',
-        impressions: 110480,
-        clicks: 8490,
-        spend: 3450.00,
-        reach: 54100,
-        conversions: 620,
-        cpc: 0.41,
-        cpl: 5.56,
-      },
-      {
-        campaignId: 'cam_10928374',
-        campaignName: '✦ Credit Repair Retargeting - CROA Warm Leads',
-        impressions: 32000,
-        clicks: 1450,
-        spend: 850.00,
-        reach: 14200,
-        conversions: 95,
-        cpc: 0.58,
-        cpl: 8.94,
-      },
-    ];
+    // NOT CONFIGURED → no fabricated telemetry. Connect Meta in
+    // Settings → Integrations to stream live Marketing API insights.
+    console.warn('[meta] Marketing API not configured — returning no insights.');
+    return [];
   }
 
   try {

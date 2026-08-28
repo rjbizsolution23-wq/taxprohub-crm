@@ -1,6 +1,7 @@
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useAppStore } from '../store';
+import { apiHealthDetail } from '../utils/api';
 import { 
   Users, DollarSign, Calendar, TrendingUp, Mail, Phone, Clock, 
   CheckCircle, Shield, Award, Sparkles, ArrowUpRight, AlertTriangle,
@@ -12,63 +13,47 @@ import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, R
 // Gold theme colors matching the brand
 const GOLD_COLORS = ['#D4AF37', '#FFD700', '#F59E0B', '#B8860B', '#AA7C11'];
 
-// 12-month revenue trend data
-const revenue12MonthData = [
-  { month: 'Jan', revenue: 12500, target: 15000 },
-  { month: 'Feb', revenue: 18200, target: 15000 },
-  { month: 'Mar', revenue: 22100, target: 15000 },
-  { month: 'Apr', revenue: 39800, target: 20000 }, // peak tax month
-  { month: 'May', revenue: 28500, target: 15000 },
-  { month: 'Jun', revenue: 32400, target: 20000 },
-  { month: 'Jul', revenue: 29100, target: 20000 },
-  { month: 'Aug', revenue: 31000, target: 20000 },
-  { month: 'Sep', revenue: 34500, target: 25000 }, // quarterly filings
-  { month: 'Oct', revenue: 42100, target: 25000 }, // extensions peak
-  { month: 'Nov', revenue: 27800, target: 20000 },
-  { month: 'Dec', revenue: 35900, target: 25000 },
-];
-
-// Active filing pipeline funnel stages
-const filingPipelineData = [
-  { stage: 'Inquiry', count: 145, pct: '100%' },
-  { stage: 'Docs Received', count: 98, pct: '67%' },
-  { stage: 'Preparer Sync', count: 72, pct: '49%' },
-  { stage: 'Under Review', count: 45, pct: '31%' },
-  { stage: 'Filed', count: 32, pct: '22%' },
-  { stage: 'Accepted', count: 28, pct: '19%' },
-];
-
-const initialTasks = [
-  { id: 1, title: 'Send Engagement Letter & Form 8879 to Sarah Jenkins', client: 'Jenkins Household', assignee: 'Rick Jefferson', priority: 'urgent', due: 'Today, 5:00 PM', status: 'To-Do', sla: '1h remaining', tags: ['Tax Prep', 'E-Sign'], subtasks: 3, comments: 2 },
-  { id: 2, title: 'Resolve CP2000 Matching Notice for Robert Dow', client: 'Robert Dow', assignee: 'Jane Doe', priority: 'high', due: 'Today, 6:00 PM', status: 'In-Progress', sla: '2h remaining', tags: ['IRS Notice', 'Audit Shield'], subtasks: 5, comments: 4 },
-  { id: 3, title: 'Verify Bank Routing for Refund Advance Check', client: 'Alisa Sterling', assignee: 'Rick Jefferson', priority: 'medium', due: 'Tomorrow', status: 'In-Progress', sla: '24h remaining', tags: ['Bank Product'], subtasks: 1, comments: 1 },
-  { id: 4, title: 'Schedule Q2 Quarterly Estimate Briefing', client: 'Apex Widgets LLC', assignee: 'Support Team', priority: 'low', due: 'This Week', status: 'Done', sla: 'Met', tags: ['Quarterly'], subtasks: 2, comments: 0 },
-  { id: 5, title: 'Review AFSP Preparer CE Status Updates', client: 'Internal Compliance', assignee: 'Rick Jefferson', priority: 'high', due: 'In 3 days', status: 'Blocked', sla: '72h remaining', tags: ['Credentials'], subtasks: 0, comments: 5 }
-];
-
 export default function DashboardPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const activeTab = searchParams.get('tab') || 'dashboard';
   const navigate = useNavigate();
   
   // App store states
-  const { contacts, currentSubAccount } = useAppStore();
+  const { contacts, currentSubAccount, deals, pipelines, appointments, subAccounts, allDeals } = useAppStore();
 
   // Tasks States
-  const [tasksList, setTasksList] = useState(initialTasks);
+  // LIVE task queue — starts empty; tasks are created by the user or by AI parsing.
+  const [tasksList, setTasksList] = useState<any[]>([]);
   const [taskView, setTaskView] = useState<'list' | 'kanban' | 'calendar' | 'client' | 'project'>('kanban');
   const [newTaskInput, setNewTaskInput] = useState('');
   const [aiGenerating, setAiGenerating] = useState(false);
-  const [overdueCount, setOverdueCount] = useState(2);
+  const overdueCount = useMemo(() => tasksList.filter((t: any) => t.status !== 'Done' && String(t.due || '').toLowerCase().includes('today')).length, [tasksList]);
 
-  // System Status State
-  const [systemStatuses, setSystemStatuses] = useState({
-    TaxSlayer: 'green',
-    Twilio: 'green',
-    Stripe: 'green',
-    Lob: 'green',
-    Gemini: 'green',
-  });
+  // System Status — LIVE from the Cloudflare /api/health endpoint.
+  const [systemStatuses, setSystemStatuses] = useState<Record<string, string>>({});
+  const [healthCheckedAt, setHealthCheckedAt] = useState<string>('never');
+
+  const refreshSystemHealth = async () => {
+    const health = await apiHealthDetail();
+    const integrations = health.integrations;
+    const label: Record<string, string> = {
+      database_d1: 'D1 Database',
+      kv_ledger: 'KV Ledger',
+      twilio: 'Twilio SMS',
+      resend: 'Resend Email',
+      stripe: 'Stripe Billing',
+      openai: 'AI Engine',
+      cloudflare_calls: 'CF Calls',
+    };
+    const next: Record<string, string> = {};
+    Object.entries(integrations).forEach(([key, on]) => {
+      next[label[key] || key] = on ? 'green' : 'yellow';
+    });
+    setSystemStatuses(next);
+    setHealthCheckedAt(new Date().toLocaleTimeString());
+  };
+
+  useEffect(() => { void refreshSystemHealth(); }, []);
 
   // Countdown timer calculation (IRS Deadline April 15 / Quarterly June 15)
   const [deadlineCountdown, setDeadlineCountdown] = useState({ days: 0, hours: 0, mins: 0, secs: 0 });
@@ -96,14 +81,8 @@ export default function DashboardPage() {
     return () => clearInterval(interval);
   }, []);
 
-  // Trigger system pulse status fluctuation mock
-  const triggerSystemPulse = () => {
-    setSystemStatuses(prev => ({
-      ...prev,
-      TaxSlayer: Math.random() > 0.85 ? 'yellow' : 'green',
-      Gemini: Math.random() > 0.9 ? 'yellow' : 'green',
-    }));
-  };
+  // Manual re-poll of the live edge health endpoint.
+  const triggerSystemPulse = () => { void refreshSystemHealth(); };
 
   // AI Task Auto-creator simulation
   const handleAiTaskCreation = (e: React.FormEvent) => {
@@ -137,6 +116,88 @@ export default function DashboardPage() {
       setAiGenerating(false);
     }, 1000);
   };
+
+  /* ═══════ LIVE PRACTICE METRICS — derived from real CRM records ═══════ */
+  const isWon = (d: any) => (d.probability ?? 0) >= 100 || String(d.stageId || '').includes('stage-6');
+  const asDate = (v: any) => (v instanceof Date ? v : new Date(v));
+
+  const revenue12MonthData = useMemo(() => {
+    const now = new Date();
+    const months: { month: string; revenue: number; target: number }[] = [];
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const revenue = deals
+        .filter(x => isWon(x) && asDate(x.updatedAt || x.createdAt).getFullYear() === d.getFullYear() && asDate(x.updatedAt || x.createdAt).getMonth() === d.getMonth())
+        .reduce((sum, x) => sum + (x.value || 0), 0);
+      months.push({ month: d.toLocaleString('en-US', { month: 'short' }), revenue, target: 0 });
+    }
+    const avg = months.reduce((s, m) => s + m.revenue, 0) / 12;
+    return months.map(m => ({ ...m, target: Math.round(avg) }));
+  }, [deals]);
+
+  const filingPipelineData = useMemo(() => {
+    const pipeline = pipelines.find(p => p.isDefault) || pipelines[0];
+    if (!pipeline) return [] as { stage: string; count: number; pct: string }[];
+    const stages = [...pipeline.stages].sort((a, b) => a.position - b.position);
+    const counts = stages.map(st => deals.filter(d => d.stageId === st.id).length);
+    const top = counts[0] || Math.max(0, ...counts);
+    return stages.map((st, i) => ({
+      stage: st.name,
+      count: counts[i],
+      pct: `${top ? Math.round((counts[i] / top) * 100) : 0}%`,
+    }));
+  }, [deals, pipelines]);
+
+  const mtdRevenue = useMemo(() => {
+    const now = new Date();
+    return deals
+      .filter(d => isWon(d) && asDate(d.updatedAt || d.createdAt).getFullYear() === now.getFullYear() && asDate(d.updatedAt || d.createdAt).getMonth() === now.getMonth())
+      .reduce((s, d) => s + (d.value || 0), 0);
+  }, [deals]);
+
+  const openPipelineValue = useMemo(
+    () => deals.filter(d => !isWon(d)).reduce((s, d) => s + (d.value || 0) * ((d.probability ?? 0) / 100 || 1), 0),
+    [deals]
+  );
+
+  const returnsYtd = useMemo(() => {
+    const y = new Date().getFullYear();
+    return deals.filter(d => isWon(d) && asDate(d.updatedAt || d.createdAt).getFullYear() === y).length;
+  }, [deals]);
+
+  const refundsFiled = useMemo(
+    () => deals.reduce((s, d: any) => s + (d.estimatedRefund || 0), 0),
+    [deals]
+  );
+
+  const conversionRate = useMemo(() => {
+    if (!deals.length) return 0;
+    return Math.round((deals.filter(isWon).length / deals.length) * 100);
+  }, [deals]);
+
+  const currency = (n: number) => `$${Math.round(n).toLocaleString()}`;
+
+  const leaderboard = useMemo(() => {
+    return subAccounts
+      .map(sa => ({
+        name: sa.name,
+        total: (allDeals || []).filter((d: any) => d.subAccountId === sa.id && isWon(d)).reduce((s: number, d: any) => s + (d.value || 0), 0),
+      }))
+      .sort((a, b) => b.total - a.total)
+      .slice(0, 3);
+  }, [subAccounts, allDeals]);
+
+  // Highest-value open deal and next scheduled appointment power the insight cards.
+  const hotDeal = useMemo(
+    () => [...deals].filter(d => !isWon(d)).sort((a, b) => (b.value || 0) - (a.value || 0))[0] || null,
+    [deals]
+  );
+  const nextAppointment = useMemo(
+    () => [...appointments]
+      .filter(a => asDate(a.startTime).getTime() >= Date.now())
+      .sort((a, b) => asDate(a.startTime).getTime() - asDate(b.startTime).getTime())[0] || null,
+    [appointments]
+  );
 
   const handleToggleTaskStatus = (taskId: number, newStatus: string) => {
     setTasksList(prev => prev.map(t => t.id === taskId ? { ...t, status: newStatus } : t));
@@ -211,7 +272,7 @@ export default function DashboardPage() {
                 </span>
               </div>
               <div className="mt-4">
-                <p className="text-2xl font-black text-white tracking-tight">{contacts.length || 247}</p>
+                <p className="text-2xl font-black text-white tracking-tight">{contacts.length}</p>
                 <p className="text-[10px] text-slate-400 mt-0.5 font-bold uppercase tracking-wider font-mono">Active Clients</p>
               </div>
             </div>
@@ -227,7 +288,7 @@ export default function DashboardPage() {
                 </span>
               </div>
               <div className="mt-4">
-                <p className="text-2xl font-black text-white tracking-tight">$28,500</p>
+                <p className="text-2xl font-black text-white tracking-tight">{currency(mtdRevenue)}</p>
                 <p className="text-[10px] text-slate-400 mt-0.5 font-bold uppercase tracking-wider font-mono">MTD Revenue</p>
               </div>
             </div>
@@ -243,7 +304,7 @@ export default function DashboardPage() {
                 </span>
               </div>
               <div className="mt-4">
-                <p className="text-2xl font-black text-white tracking-tight">$128,500</p>
+                <p className="text-2xl font-black text-white tracking-tight">{currency(openPipelineValue)}</p>
                 <p className="text-[10px] text-slate-400 mt-0.5 font-bold uppercase tracking-wider font-mono">Open Pipeline</p>
               </div>
             </div>
@@ -259,7 +320,7 @@ export default function DashboardPage() {
                 </span>
               </div>
               <div className="mt-4">
-                <p className="text-2xl font-black text-white tracking-tight">142</p>
+                <p className="text-2xl font-black text-white tracking-tight">{returnsYtd}</p>
                 <p className="text-[10px] text-slate-400 mt-0.5 font-bold uppercase tracking-wider font-mono">Returns YTD</p>
               </div>
             </div>
@@ -275,7 +336,7 @@ export default function DashboardPage() {
                 </span>
               </div>
               <div className="mt-4">
-                <p className="text-2xl font-black text-white tracking-tight">$412,850</p>
+                <p className="text-2xl font-black text-white tracking-tight">{currency(refundsFiled)}</p>
                 <p className="text-[10px] text-slate-400 mt-0.5 font-bold uppercase tracking-wider font-mono">Refunds Filed</p>
               </div>
             </div>
@@ -291,7 +352,7 @@ export default function DashboardPage() {
                 </span>
               </div>
               <div className="mt-4">
-                <p className="text-2xl font-black text-white tracking-tight">32%</p>
+                <p className="text-2xl font-black text-white tracking-tight">{conversionRate}%</p>
                 <p className="text-[10px] text-slate-400 mt-0.5 font-bold uppercase tracking-wider font-mono">Conversion Rate</p>
               </div>
             </div>
@@ -418,13 +479,16 @@ export default function DashboardPage() {
               </div>
 
               <div className="space-y-3.5 my-4">
+                {Object.keys(systemStatuses).length === 0 && (
+                  <p className="text-[11px] text-slate-500 font-mono">Polling /api/health…</p>
+                )}
                 {Object.entries(systemStatuses).map(([key, value]) => (
                   <div key={key} className="flex items-center justify-between p-2.5 bg-neutral-900/50 rounded-xl border border-[#1f2937]/50">
-                    <span className="text-xs font-semibold text-slate-200">{key} Integration</span>
+                    <span className="text-xs font-semibold text-slate-200">{key}</span>
                     <div className="flex items-center gap-2">
                       <span className={`w-2 h-2 rounded-full ${value === 'green' ? 'bg-emerald-400 animate-pulse' : 'bg-yellow-400 animate-bounce'}`}></span>
                       <span className="text-[10px] font-bold font-mono uppercase text-slate-400">
-                        {value === 'green' ? 'ONLINE' : 'STRESSED'}
+                        {value === 'green' ? 'ONLINE' : 'NOT CONFIGURED'}
                       </span>
                     </div>
                   </div>
@@ -432,7 +496,7 @@ export default function DashboardPage() {
               </div>
 
               <div className="text-[10px] text-slate-500 font-mono text-center pt-2 border-t border-neutral-900">
-                Direct TaxSlayer Desktop Sync Adapter: active
+                Live edge health poll — last checked {healthCheckedAt}
               </div>
             </div>
 
@@ -444,18 +508,15 @@ export default function DashboardPage() {
               </div>
 
               <div className="space-y-3.5 my-4">
-                <div className="flex justify-between items-center text-xs">
-                  <span className="font-bold text-white">1. Apex Tax Group LLC</span>
-                  <span className="font-mono text-[#D4AF37] font-black">$48,200</span>
-                </div>
-                <div className="flex justify-between items-center text-xs">
-                  <span className="font-bold text-white">2. Jefferson Solutions Inc</span>
-                  <span className="font-mono text-[#D4AF37] font-black">$31,500</span>
-                </div>
-                <div className="flex justify-between items-center text-xs">
-                  <span className="font-bold text-slate-300">3. Elite Prep Partners</span>
-                  <span className="font-mono text-[#D4AF37] font-black">$19,250</span>
-                </div>
+                {leaderboard.length === 0 && (
+                  <p className="text-[11px] text-slate-500 font-mono">No sub-account revenue recorded yet.</p>
+                )}
+                {leaderboard.map((row, i) => (
+                  <div key={row.name} className="flex justify-between items-center text-xs">
+                    <span className={i === 0 ? 'font-bold text-white' : 'font-bold text-slate-300'}>{i + 1}. {row.name}</span>
+                    <span className="font-mono text-[#D4AF37] font-black">{currency(row.total)}</span>
+                  </div>
+                ))}
               </div>
 
               <a href="#/admin" className="text-xs text-[#D4AF37] hover:underline font-bold text-center block pt-4 border-t border-neutral-900">
@@ -502,8 +563,12 @@ export default function DashboardPage() {
                 <div className="text-[10px] uppercase font-mono font-bold text-emerald-400 flex items-center gap-1">
                   <Sparkles className="h-3 w-3" /> Hot Lead Priority
                 </div>
-                <div className="text-sm font-black text-white mt-2">Alisa Sterling</div>
-                <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">S-Corp reasonable compensation calculator run. Missing final Form 1099-K data.</p>
+                <div className="text-sm font-black text-white mt-2">{hotDeal ? (hotDeal.contactName || hotDeal.name) : 'No open deals'}</div>
+                <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">
+                  {hotDeal
+                    ? `${hotDeal.name} — ${currency(hotDeal.value || 0)} at ${hotDeal.probability ?? 0}% probability.`
+                    : 'Create a deal to see your highest-value open opportunity here.'}
+                </p>
                 <button onClick={() => navigate('/contacts')} className="text-xs text-[#D4AF37] mt-4 font-bold flex items-center gap-1 hover:underline">
                   Launch Doc Chaser Agent →
                 </button>
@@ -513,8 +578,12 @@ export default function DashboardPage() {
                 <div className="text-[10px] uppercase font-mono font-bold text-[#D4AF37] flex items-center gap-1">
                   <Award className="h-3.5 w-3.5" /> Next Best Action
                 </div>
-                <div className="text-sm font-black text-white mt-2">Sarah Jenkins</div>
-                <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">Form 1040 draft filing complete. Eligible for Refund Advance products ($2.5k limit).</p>
+                <div className="text-sm font-black text-white mt-2">{nextAppointment ? nextAppointment.title : 'Nothing scheduled'}</div>
+                <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">
+                  {nextAppointment
+                    ? `Next on the calendar: ${asDate(nextAppointment.startTime).toLocaleString()}.`
+                    : 'Book an appointment and it will surface here automatically.'}
+                </p>
                 <button onClick={() => navigate('/tax?tab=bank')} className="text-xs text-[#D4AF37] mt-4 font-bold flex items-center gap-1 hover:underline">
                   Pitch Bank Refund Advance →
                 </button>
@@ -541,7 +610,7 @@ export default function DashboardPage() {
 
             <div className="bg-neutral-950 border border-[#D4AF37]/15 rounded-2xl p-4 flex items-center justify-between">
               <div>
-                <p className="text-2xl font-black text-white font-mono">2</p>
+                <p className="text-2xl font-black text-white font-mono">{tasksList.filter((t: any) => String(t.due || '').toLowerCase().includes('today')).length}</p>
                 <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider font-mono">Due Today</p>
               </div>
               <div className="p-2.5 bg-[#D4AF37]/5 rounded-xl border border-[#D4AF37]/15">
@@ -551,8 +620,8 @@ export default function DashboardPage() {
 
             <div className="bg-neutral-950 border border-[#D4AF37]/15 rounded-2xl p-4 flex items-center justify-between">
               <div>
-                <p className="text-2xl font-black text-white font-mono">4</p>
-                <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider font-mono">Due This Week</p>
+                <p className="text-2xl font-black text-white font-mono">{tasksList.filter((t: any) => t.status !== 'Done').length}</p>
+                <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider font-mono">Open Tasks</p>
               </div>
               <div className="p-2.5 bg-[#D4AF37]/5 rounded-xl border border-[#D4AF37]/15">
                 <Calendar className="h-4 w-4 text-[#D4AF37]" />
@@ -561,8 +630,8 @@ export default function DashboardPage() {
 
             <div className="bg-neutral-950 border border-[#D4AF37]/15 rounded-2xl p-4 flex items-center justify-between">
               <div>
-                <p className="text-2xl font-black text-emerald-400 font-mono">18</p>
-                <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider font-mono">Completed (7d)</p>
+                <p className="text-2xl font-black text-emerald-400 font-mono">{tasksList.filter((t: any) => t.status === 'Done').length}</p>
+                <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider font-mono">Completed</p>
               </div>
               <div className="p-2.5 bg-emerald-500/5 rounded-xl border border-emerald-500/15">
                 <CheckCircle className="h-4 w-4 text-emerald-400" />
@@ -571,8 +640,8 @@ export default function DashboardPage() {
 
             <div className="bg-neutral-950 border border-[#D4AF37]/15 rounded-2xl p-4 flex items-center justify-between">
               <div>
-                <p className="text-2xl font-black text-[#D4AF37] font-mono">3 / 5</p>
-                <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider font-mono">My vs Team Tasks</p>
+                <p className="text-2xl font-black text-[#D4AF37] font-mono">{tasksList.length}</p>
+                <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider font-mono">Total Tasks</p>
               </div>
               <div className="p-2.5 bg-[#D4AF37]/5 rounded-xl border border-[#D4AF37]/15">
                 <User className="h-4 w-4 text-[#D4AF37]" />
@@ -737,7 +806,7 @@ export default function DashboardPage() {
                       <td className="p-4">
                         <div className="font-bold text-white mb-1">{task.title}</div>
                         <div className="flex gap-1.5">
-                          {task.tags.map(tag => (
+                          {task.tags.map((tag: string) => (
                             <span key={tag} className="text-[9px] font-mono bg-neutral-900 border border-neutral-800 text-[#D4AF37] px-2 py-0.5 rounded-md">{tag}</span>
                           ))}
                         </div>
@@ -799,7 +868,7 @@ function BotIcon({ className }: { className?: string }) {
 }
 
 // Sub-component: Individual Task Card
-function TaskCard({ task, onMove }: { task: typeof initialTasks[0], onMove: (id: number, status: string) => void }) {
+function TaskCard({ task, onMove }: { task: any, onMove: (id: number, status: string) => void }) {
   return (
     <div className="bg-neutral-900/80 border border-[#D4AF37]/10 rounded-2xl p-4 hover:border-[#D4AF37]/25 transition-all shadow-md group relative">
       <div className="flex justify-between items-start mb-2">
@@ -817,7 +886,7 @@ function TaskCard({ task, onMove }: { task: typeof initialTasks[0], onMove: (id:
       </div>
 
       <div className="flex flex-wrap gap-1 mt-3">
-        {task.tags.map(tag => (
+        {task.tags.map((tag: string) => (
           <span key={tag} className="text-[8px] font-black font-mono tracking-wide uppercase bg-neutral-950 border border-neutral-800 text-slate-400 px-1.5 py-0.5 rounded">
             {tag}
           </span>

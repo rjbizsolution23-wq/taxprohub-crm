@@ -9,89 +9,6 @@ import {
 import { ReferralsTab, CreditClientsTab, DisputesTab, DisputeLettersTab } from '../components/contacts/GrowthTabs';
 import type { Contact } from '../types';
 
-const sampleContacts: Contact[] = [
-  {
-    id: '1',
-    firstName: 'John',
-    lastName: 'Smith',
-    email: 'john.smith@example.com',
-    phone: '(555) 123-4567',
-    company: 'Smith Consulting',
-    tags: ['lead', 'high-value'],
-    customFields: {},
-    source: 'Website',
-    status: 'lead',
-    notes: [],
-    activities: [],
-    createdAt: new Date(),
-    updatedAt: new Date(),
-  },
-  {
-    id: '2',
-    firstName: 'Sarah',
-    lastName: 'Jenkins',
-    email: 'sjenkins@gmail.com',
-    phone: '(414) 220-1928',
-    company: 'RJ Business Solutions Partner',
-    tags: ['customer', 'tax-prep'],
-    customFields: {},
-    source: 'Referral',
-    status: 'customer',
-    notes: [],
-    activities: [],
-    createdAt: new Date(),
-    updatedAt: new Date(),
-  },
-  {
-    id: '3',
-    firstName: 'Michael',
-    lastName: 'Brown',
-    email: 'mbrown@startup.io',
-    phone: '(555) 345-6789',
-    company: 'Startup IO',
-    tags: ['prospect', 's-corp'],
-    customFields: {},
-    source: 'Social Media',
-    status: 'prospect',
-    notes: [],
-    activities: [],
-    createdAt: new Date(),
-    updatedAt: new Date(),
-  },
-  {
-    id: '4',
-    firstName: 'Emily',
-    lastName: 'Davis',
-    email: 'emily.davis@consulting.com',
-    phone: '(555) 456-7890',
-    company: 'Davis Consulting',
-    tags: ['lead', '1099-contractor'],
-    customFields: {},
-    source: 'Website',
-    status: 'lead',
-    notes: [],
-    activities: [],
-    createdAt: new Date(),
-    updatedAt: new Date(),
-  },
-  {
-    id: '5',
-    firstName: 'Robert',
-    lastName: 'Wilson',
-    email: 'rwilson@finance.com',
-    phone: '(555) 567-8901',
-    company: 'Wilson Finance',
-    tags: ['customer', 'recurring'],
-    customFields: {},
-    source: 'Direct',
-    status: 'customer',
-    notes: [],
-    activities: [],
-    createdAt: new Date(),
-    updatedAt: new Date(),
-  },
-];
-
 export default function ContactsPage() {
   const navigate = useNavigate();
   const { contacts, addContact, updateContact, deleteContact } = useAppStore();
@@ -133,7 +50,7 @@ export default function ContactsPage() {
     { name: '1099-contractor', color: 'bg-amber-500/10 text-amber-500 border-amber-500/20', count: 1 },
   ]);
 
-  const allContacts = contacts.length > 0 ? contacts : sampleContacts;
+  const allContacts = contacts;
 
   const filteredContacts = allContacts.filter((contact) => {
     const matchesSearch =

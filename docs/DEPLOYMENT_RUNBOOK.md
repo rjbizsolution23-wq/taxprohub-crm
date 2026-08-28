@@ -167,20 +167,25 @@ Local D1 persists in `.wrangler/state`. To reset local data:
 
 ## Appendix: GitHub Actions workflow (`.github/workflows/deploy.yml`)
 
-> ⚠️ This file is intentionally kept out of Git pushes made with a GitHub App
-> that lacks the `workflows` permission. Paste it as
-> `.github/workflows/deploy.yml` when you commit from a token/account that has
-> **Workflows: Read & write** access, or commit it via the GitHub web UI
-> (Add file → Create new file) — GitHub then runs it on the next push.
+> This file exists in the working tree but **cannot be pushed by the Arena GitHub App**
+> (a GitHub App needs the `workflows` permission to create/update workflow files).
+> Add it yourself: GitHub → *Add file → Create new file* → path
+> `.github/workflows/deploy.yml` → paste the YAML below → Commit.
+>
+> Then add the two repository secrets (Settings → Secrets and variables → Actions):
+> `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`, and run the workflow
+> (Actions → *Deploy to Cloudflare Pages* → *Run workflow*). CI does the whole
+> job: create D1 + KV, apply migrations, create the Pages project, deploy.
 
 ```yaml
 name: Deploy to Cloudflare Pages
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'arena/**']
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -194,34 +199,53 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm run build
-      - uses: actions/upload-artifact@v4
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
           if-no-files-found: error
 
   deploy-preview:
+    # Pull requests → preview deployment (branch deployments on Pages)
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     needs: build
     runs-on: ubuntu-latest
     environment: cloudflare-pages
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist
+
       - name: Configure D1 & KV (create if missing)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: node scripts/setup-cf.mjs
+        run: |
+          node scripts/setup-cf.mjs
+
       - name: Deploy preview to Cloudflare Pages
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -229,23 +253,33 @@ jobs:
         run: |
           npx wrangler pages deploy dist \
             --project-name tax-pro-hub-university \
-            --branch preview-${{ github.event.pull_request.number }}
+            --branch preview-${{ github.event.pull_request.number }} \
+            --commit-dirty=true
 
   deploy-production:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     environment: cloudflare-pages
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist
-      - name: Configure D1 & KV + migrations
+
+      - name: Configure D1 & KV (create if missing) + migrations
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: node scripts/setup-cf.mjs
+        run: |
+          node scripts/setup-cf.mjs
+
       - name: Deploy production to Cloudflare Pages
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -253,8 +287,6 @@ jobs:
         run: |
           npx wrangler pages deploy dist \
             --project-name tax-pro-hub-university \
-            --branch main
+            --branch main \
+            --commit-dirty=true
 ```
-
-**Repository secrets** required by this workflow:
-`CLOUDFLARE_API_TOKEN` · `CLOUDFLARE_ACCOUNT_ID`

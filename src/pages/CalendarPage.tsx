@@ -28,16 +28,9 @@ interface BookingLink {
   bookings: number;
 }
 
-const sampleAppointments: AppointmentType[] = [
-  { id: '1', title: 'Tax Consultation - Mike Brown', startTime: new Date(), endTime: new Date(), type: 'consultation', status: 'confirmed', description: 'Initial corporate S-Corp planning consultation' },
-  { id: '2', title: 'Follow-up Call - Lisa Chen', startTime: new Date(), endTime: new Date(), type: 'call', status: 'scheduled', description: 'Checking on W-2 retrieval status' },
-  { id: '3', title: 'Tax Review - ABC Corp', startTime: new Date(new Date().setDate(new Date().getDate() + 1)), endTime: new Date(), type: 'meeting', status: 'confirmed', description: 'Year 2025 dual filing review' },
-  { id: '4', title: 'Webinar: Tax Planning 2026', startTime: new Date(new Date().setDate(new Date().getDate() + 2)), endTime: new Date(), type: 'webinar', status: 'scheduled', description: 'White label webinar presentation for RJ Partners' },
-];
-
 export default function CalendarPage() {
   const { appointments, addAppointment, updateAppointment } = useAppStore();
-  const allAppointments = (appointments.length > 0 ? appointments : sampleAppointments) as AppointmentType[];
+  const allAppointments = appointments as AppointmentType[];
 
   const [activeTab, setActiveTab] = useState<'scheduler' | 'list' | 'links' | 'editor'>('scheduler');
   const [currentMonth, setCurrentMonth] = useState(new Date());

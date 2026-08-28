@@ -3,16 +3,10 @@ import { useAppStore } from '../store';
 import { Plus, Globe, Eye, Edit, Trash2, ExternalLink, Award } from 'lucide-react';
 import AIPromptBar from '../components/layout/AIPromptBar';
 
-const sampleWebsites = [
-  { id: '1', name: 'Tax Pro Hub University', domain: 'myvirtualtax.com', pages: [{ id: 'p1', title: 'Home', slug: '/', content: '', isHome: true, published: true }, { id: 'p2', title: 'Services', slug: '/services', content: '', isHome: false, published: true }, { id: 'p3', title: 'About', slug: '/about', content: '', isHome: false, published: true }, { id: 'p4', title: 'Contact', slug: '/contact', content: '', isHome: false, published: true }], theme: { primaryColor: '#D4AF37', secondaryColor: '#111111', fontFamily: 'Inter', headerStyle: 'modern', footerStyle: 'classic' }, published: true, createdAt: new Date(), updatedAt: new Date() },
-  { id: '2', name: 'Tax Blog', domain: 'blog.myvirtualtax.com', pages: [{ id: 'p1', title: 'Blog Home', slug: '/', content: '', isHome: true, published: true }], theme: { primaryColor: '#10B981', secondaryColor: '#059669', fontFamily: 'Georgia', headerStyle: 'minimal', footerStyle: 'minimal' }, published: true, createdAt: new Date(), updatedAt: new Date() },
-  { id: '3', name: 'Client Portal', pages: [{ id: 'p1', title: 'Portal', slug: '/', content: '', isHome: true, published: false }], theme: { primaryColor: '#D4AF37', secondaryColor: '#111111', fontFamily: 'Inter', headerStyle: 'modern', footerStyle: 'modern' }, published: false, createdAt: new Date(), updatedAt: new Date() },
-];
-
 export default function WebsitesPage() {
   const navigate = useNavigate();
   const { websites } = useAppStore();
-  const allWebsites = websites.length > 0 ? websites : sampleWebsites;
+  const allWebsites = websites;
 
   return (
     <div className="space-y-8 pb-12">

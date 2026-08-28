@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { 
   TrendingUp, DollarSign, Users, Award, Percent, Calendar, 
@@ -58,7 +58,7 @@ export default function AnalyticsPage() {
   const [isSimulatingWebhook, setIsSimulatingWebhook] = useState(false);
 
   // App store actions to manipulate CRM contact database during simulations
-  const { addContact, subAccounts } = useAppStore();
+  const { addContact, subAccounts, contacts, deals, pipelines } = useAppStore();
 
   // Deterministic per-sub-account performance metrics (derived from account id so numbers are stable across renders)
   const perfRows = subAccounts.map((sa, i) => {
@@ -223,39 +223,79 @@ export default function AnalyticsPage() {
     }
   };
 
-  // Mock data for Recharts (Pre-existing tabs)
-  const overviewChartData = [
-    { name: 'Jan', Revenue: 12500, Expenses: 4500, Leads: 120 },
-    { name: 'Feb', Revenue: 14200, Expenses: 4800, Leads: 140 },
-    { name: 'Mar', Revenue: 28500, Expenses: 6200, Leads: 280 }, // Tax season rush peak
-    { name: 'Apr', Revenue: 34100, Expenses: 7100, Leads: 320 },
-    { name: 'May', Revenue: 18400, Expenses: 5100, Leads: 190 },
-    { name: 'Jun', Revenue: 16500, Expenses: 4900, Leads: 150 },
-  ];
+  /* ═══════ LIVE ANALYTICS — derived from the tenant's real CRM records ═══════
+     No fabricated numbers: every series below is computed from live contacts,
+     deals and pipelines. Empty practices render empty charts (placeholders). */
 
-  const leadSourceData = [
-    { name: 'Organic Search', value: 340, color: '#06b6d4' },
-    { name: 'Referrals', value: 210, color: '#ec4899' },
-    { name: 'Paid Ads', value: 180, color: '#8b5cf6' },
-    { name: 'Social Media', value: 120, color: '#10b981' },
-  ];
+  const monthKey = (d: Date) => d.toLocaleString('en-US', { month: 'short' });
 
-  const conversionFunnelData = [
-    { stage: 'New Leads', count: 850, percentage: 100, fill: '#6366f1' },
-    { stage: 'Contacted', count: 580, percentage: 68, fill: '#8b5cf6' },
-    { stage: 'Qualified', count: 390, percentage: 45, fill: '#ec4899' },
-    { stage: 'Proposals Sent', count: 240, percentage: 28, fill: '#f59e0b' },
-    { stage: 'Closed Won', count: 185, percentage: 21, fill: '#10b981' },
-  ];
+  const lastSixMonths = useMemo(() => {
+    const out: { key: string; year: number; month: number }[] = [];
+    const now = new Date();
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      out.push({ key: monthKey(d), year: d.getFullYear(), month: d.getMonth() });
+    }
+    return out;
+  }, []);
 
-  const mrrGrowthData = [
-    { name: 'Jan', MRR: 4500 },
-    { name: 'Feb', MRR: 4800 },
-    { name: 'Mar', MRR: 6200 },
-    { name: 'Apr', MRR: 7900 },
-    { name: 'May', MRR: 9700 },
-    { name: 'Jun', MRR: 11400 },
-  ];
+  const overviewChartData = useMemo(() => lastSixMonths.map(({ key, year, month }) => {
+    const inMonth = (v: any) => {
+      const d = v instanceof Date ? v : new Date(v);
+      return d.getFullYear() === year && d.getMonth() === month;
+    };
+    const wonRevenue = deals
+      .filter(d => inMonth(d.updatedAt || d.createdAt) && (d.probability ?? 0) >= 100)
+      .reduce((sum, d) => sum + (d.value || 0), 0);
+    return {
+      name: key,
+      Revenue: wonRevenue,
+      Expenses: 0,
+      Leads: contacts.filter(c => inMonth(c.createdAt)).length,
+    };
+  }), [deals, contacts, lastSixMonths]);
+
+  const leadSourceData = useMemo(() => {
+    const palette = ['#06b6d4', '#ec4899', '#8b5cf6', '#10b981', '#f59e0b', '#6366f1'];
+    const counts = new Map<string, number>();
+    contacts.forEach(c => {
+      const src = (c.source || 'Unattributed').trim();
+      counts.set(src, (counts.get(src) || 0) + 1);
+    });
+    return Array.from(counts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 6)
+      .map(([name, value], i) => ({ name, value, color: palette[i % palette.length] }));
+  }, [contacts]);
+
+  const conversionFunnelData = useMemo(() => {
+    const pipeline = pipelines.find(p => p.isDefault) || pipelines[0];
+    if (!pipeline) return [] as { stage: string; count: number; percentage: number; fill: string }[];
+    const palette = ['#6366f1', '#8b5cf6', '#ec4899', '#f59e0b', '#10b981', '#22d3ee', '#ef4444'];
+    const stages = [...pipeline.stages].sort((a, b) => a.position - b.position);
+    const counts = stages.map(st => deals.filter(d => d.stageId === st.id).length);
+    const top = counts[0] || counts.reduce((m, v) => Math.max(m, v), 0) || 0;
+    return stages.map((st, i) => ({
+      stage: st.name,
+      count: counts[i],
+      percentage: top ? Math.round((counts[i] / top) * 100) : 0,
+      fill: palette[i % palette.length],
+    }));
+  }, [deals, pipelines]);
+
+  const mrrGrowthData = useMemo(() => {
+    let running = 0;
+    return lastSixMonths.map(({ key, year, month }) => {
+      running += deals
+        .filter(d => {
+          const raw = d.updatedAt || d.createdAt;
+          const dt = raw instanceof Date ? raw : new Date(raw as any);
+          return dt.getFullYear() === year && dt.getMonth() === month && (d.probability ?? 0) >= 100;
+        })
+        .reduce((sum, d) => sum + (d.value || 0), 0);
+      return { name: key, MRR: running };
+    });
+  }, [deals, lastSixMonths]);
 
   return (
     <div className="space-y-6 text-white bg-slate-900 min-h-screen p-1">

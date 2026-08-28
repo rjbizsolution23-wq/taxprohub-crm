@@ -3,16 +3,10 @@ import { useAppStore } from '../store';
 import { Plus, FileText, Copy, Trash2, Eye, Settings, Sparkles, Award } from 'lucide-react';
 import AIPromptBar from '../components/layout/AIPromptBar';
 
-const sampleForms = [
-  { id: '1', name: 'Contact Form', fields: [{ id: 'f1', type: 'text' as const, label: 'Name', required: true, position: 0 }, { id: 'f2', type: 'email' as const, label: 'Email', required: true, position: 1 }, { id: 'f3', type: 'phone' as const, label: 'Phone', required: false, position: 2 }, { id: 'f4', type: 'textarea' as const, label: 'Message', required: true, position: 3 }], settings: { submitButtonText: 'Send Message', successMessage: 'Thank you!', storeSubmissions: true }, submissions: [], createdAt: new Date(), updatedAt: new Date() },
-  { id: '2', name: 'Tax Consultation Request', fields: [{ id: 'f1', type: 'text' as const, label: 'Full Name', required: true, position: 0 }, { id: 'f2', type: 'email' as const, label: 'Email', required: true, position: 1 }, { id: 'f3', type: 'select' as const, label: 'Service Type', required: true, options: ['Individual Tax', 'Business Tax', 'Tax Planning', 'IRS Help'], position: 2 }, { id: 'f4', type: 'date' as const, label: 'Preferred Date', required: false, position: 3 }], settings: { submitButtonText: 'Request Consultation', successMessage: 'We will contact you soon!', notifyEmail: 'appointments@rjbusinesssolutions.org', storeSubmissions: true }, submissions: [], createdAt: new Date(), updatedAt: new Date() },
-  { id: '3', name: 'Newsletter Signup', fields: [{ id: 'f1', type: 'email' as const, label: 'Email Address', required: true, position: 0 }, { id: 'f2', type: 'checkbox' as const, label: 'I agree to receive emails', required: true, position: 1 }], settings: { submitButtonText: 'Subscribe', successMessage: 'Welcome to our newsletter!', storeSubmissions: true }, submissions: [], createdAt: new Date(), updatedAt: new Date() },
-];
-
 export default function FormBuilder() {
   const navigate = useNavigate();
   const { forms, deleteForm } = useAppStore();
-  const allForms = forms.length > 0 ? forms : sampleForms;
+  const allForms = forms;
 
   return (
     <div className="space-y-8 pb-12">
